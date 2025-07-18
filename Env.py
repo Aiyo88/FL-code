@@ -700,17 +700,6 @@ class Env:
                     log_entry += f"    - {reason}\n"
                 f.write(log_entry + "\n")
         
-        # --- 移除核心修复逻辑 ---
-        # 由于我们已经大幅提高了约束惩罚，智能体现在有足够的动机避免“全零”决策。
-        # 移除此处的强制默认操作，可以让智能体根据其真实的决策获得反馈，从而进行更有效的学习。
-        # if not (np.any(binary_train_local) or np.any(edge_train_matrix)):
-        #     print("警告: step方法检测到无效的全零训练决策，将强制执行默认操作（设备0本地训练，云端聚合）")
-        #     # 强制设备0在本地训练
-        #     if len(train_local_decisions) > 0:
-        #         train_local_decisions[0] = 1
-        #     # 强制云端聚合
-        #     cloud_agg_decision = 1
-        #     edge_agg_decisions = np.zeros_like(edge_agg_decisions)
 
 
         # 3. 计算延迟和能耗
@@ -1018,35 +1007,7 @@ class Env:
         available_clients = parsed_action['available_clients']
         available_edges = parsed_action['available_edges']
     
-        #   # 动态创建边缘训练决策映射 - 修正索引逻辑
-        # edge_train_mapping = {}
-        # # 边缘决策向量对应的是全部N*M个选择，需要用绝对索引查找
-        # for client_id in available_clients:
-        #     try:
-        #         client_idx = int(client_id.split('_')[1])
-        #         if client_idx >= self.N:
-        #             continue
 
-        #         # 寻找该客户端得分最高的边缘节点
-        #         best_edge_id = None
-        #         max_score = -1
-        #         for edge_id in available_edges:
-        #             edge_idx = int(edge_id.split('_')[1])
-        #             if edge_idx >= self.M:
-        #                 continue
-                    
-        #             # 计算在扁平化的决策向量中的正确索引
-        #             action_vec_idx = client_idx * self.M + edge_idx
-        #             if action_vec_idx < len(edge_train_decisions):
-        #                 score = edge_train_decisions[action_vec_idx]
-        #                 if score > max_score:
-        #                     max_score = score
-        #                     best_edge_id = edge_id
-                
-        #         # 如果最高分大于0.5，则创建映射
-        #         if max_score > 0.5 and best_edge_id is not None:
-        #             edge_train_mapping[client_id] = best_edge_id
-        # --- 核心逻辑统一：确保决策解析与step()方法一致 ---
         
         # 1. 将决策向量转换为与step()方法中相同的二进制格式和矩阵格式
         train_local_binary = (train_local_decisions > 0.5).astype(int)
@@ -1072,21 +1033,7 @@ class Env:
             if client_id not in available_clients:
                 continue
         
-        # # 2. 处理训练决策
-        # drl_train_decisions = []  # 最终的训练决策列表 (1=本地训练，0=边缘训练)
-        # client_edge_mapping = {}  # 客户端到边缘节点的映射
-        # selected_edges_set = set()  # 选择的边缘节点集合
-        # selected_nodes = []  # 选择的节点列表
-        
-        # # 为每个可用的客户端分配训练决策
-        # for i, client_id in enumerate(available_clients):
-        #     if i >= self.N:  # 确保不超过设备数量限制
-        #         break
-            
-        #     # 决定该客户端是在本地训练还是边缘训练
-        #     if i < len(train_local_decisions) and train_local_decisions[i] > 0.5:
-        #         # 本地训练
-        #         drl_train_decisions.append(1)  # 1=本地训练
+     
             is_local = i < len(train_local_binary) and train_local_binary[i] == 1
             edge_selections = edge_train_matrix[i]
             
@@ -1147,10 +1094,7 @@ class Env:
             import random
             client_resources[client_id] = f_min + random.random() * (f_max - f_min)
         
-        # 注意：边缘节点的资源分配和计算开销由环境的step方法统一处理
-        # get_fl_training_params只负责解析和传递决策，不进行重复计算
-        # 因此，这里不再为边缘节点计算和填充client_resources
-        
+     
         # 5. 添加所有选定的边缘节点到训练节点列表
         selected_nodes.extend(selected_edges_set)
         
