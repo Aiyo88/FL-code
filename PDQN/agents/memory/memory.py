@@ -84,6 +84,29 @@ class Memory(object):
         if not training:
             return
 
+        # 确保输入数据维度与缓冲区匹配
+        def ensure_shape_match(data, buffer):
+            if isinstance(data, np.ndarray) and buffer.data.shape[1:] != data.shape:
+                expected_shape = buffer.data.shape[1:]
+                print(f"调整数据形状: {data.shape} -> {expected_shape}")
+                
+                # 如果是一维数组，调整长度
+                if len(data.shape) == 1 and len(expected_shape) == 1:
+                    if len(data) > expected_shape[0]:
+                        return data[:expected_shape[0]]
+                    elif len(data) < expected_shape[0]:
+                        padded = np.zeros(expected_shape)
+                        padded[:len(data)] = data
+                        return padded
+                # 对于更复杂的形状，可能需要更复杂的处理
+            return data
+
+        # 调整输入数据维度
+        state = ensure_shape_match(state, self.states)
+        action = ensure_shape_match(action, self.actions)
+        next_state = ensure_shape_match(next_state, self.next_states)
+        
+        # 添加到缓冲区
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
@@ -97,7 +120,8 @@ class Memory(object):
         self.actions.clear()
         self.rewards.clear()
         self.next_states.clear()
-        self.next_actions.clear()
+        if self.next_actions is not None:
+            self.next_actions.clear()
         self.terminals.clear()
 
     @property

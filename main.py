@@ -14,7 +14,7 @@ from Env import Env
 from clients import ClientsGroup
 from server import FederatedServer
 from drl_adapters import create_drl_agent
-from plot.plot_award import log_training_result, plot_training_results, plot_all_logs
+from plot.plot_award import log_training_result, plot_training_results, plot_all_logs, log_episode_result
 # 导入config模块
 from config import MIN_ENERGY
 
@@ -37,8 +37,8 @@ def parse_args():
     parser.add_argument('--iid', type=int, default=1, help='是否为IID数据分布 (0/1)')
     parser.add_argument('--non_iid_level', type=int, default=1, help='非IID数据分布级别 (1/2/3)')
     parser.add_argument('--epochs', type=int, default=5, help='本地训练轮数')
-    parser.add_argument('--batch_size', type=int, default=128, help='本地批次大小')
-    parser.add_argument('--lr', type=float, default=0.01, help='联邦学习学习率')
+    parser.add_argument('--batch_size', type=int, default=1024, help='本地批次大小')  # 大批次充分利用GPU
+    parser.add_argument('--lr', type=float, default=0.001, help='联邦学习学习率')
     parser.add_argument('--num_rounds', type=int, default=100, help='每个DRL Episode内联邦学习轮次的总数上限')
     parser.add_argument('--num_episodes', type=int, default=200, help='DRL训练的Episode总数上限')
     
@@ -47,10 +47,18 @@ def parse_args():
     parser.add_argument('--drl_load', type=str, default=None, help='加载DRL模型路径')
     
     # DRL 智能体超参数
-    parser.add_argument('--drl_lr', type=float, default=0.0001, help='DRL Actor网络学习率 (LR)')
-    parser.add_argument('--drl_batch_size', type=int, default=128, help='DRL 批次大小 (BATCH_SIZE)')
-    parser.add_argument('--drl_gamma', type=float, default=0.95, help='DRL 折扣因子 (GAMMA)')
+    parser.add_argument('--drl_lr', type=float, default=0.0003, help='DRL Actor网络学习率 (LR)')  # 提高学习率
+    parser.add_argument('--drl_batch_size', type=int, default=512, help='DRL 批次大小 (BATCH_SIZE)')  # 大批次利用GPU
+    parser.add_argument('--drl_gamma', type=float, default=0.99, help='DRL 折扣因子 (GAMMA)')  # 更关注长期奖励
     parser.add_argument('--drl_memory_size', type=int, default=20000, help='DRL 回放缓存区大小 (MEMORY)')
+
+    # 李雅普诺夫参数
+    parser.add_argument('--energy_threshold', type=float, default=500, help='李雅普诺夫队列能量阈值')
+
+    # GPU优化参数
+    parser.add_argument('--num_workers', type=int, default=4, help='数据加载器工作进程数')
+    parser.add_argument('--pin_memory', type=bool, default=True, help='是否将数据固定在内存中以加速GPU传输')
+    parser.add_argument('--non_blocking', type=bool, default=True, help='异步GPU数据传输')
 
     # 只保留是否需要绘图的开关
     parser.add_argument('--plot', type=int, default=1, help='是否生成参数比较图 (0/1)')
@@ -66,7 +74,7 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-def _get_default_training_params(clients_manager):
+def _get_default_training_params(clients_manager, args):
     """
     获取默认的训练参数，用于第一轮或禁用DRL时。
     选择所有可用的终端设备在本地训练，并选择第一个可用的边缘节点进行聚合。
@@ -96,30 +104,32 @@ def _get_default_training_params(clients_manager):
         'drl_train_decisions': drl_train_decisions,
     }
     
-    # 添加原始决策信息
+    # 添加与 training_args 严格一致的原始决策信息
+    edge_agg_decision = np.zeros(args.num_edges)
+    cloud_agg_decision = 0
+    if aggregation_location == "cloud":
+        cloud_agg_decision = 1
+    else:
+        try:
+            # 从 'edge_0', 'edge_1' 等字符串中提取索引
+            edge_idx = int(aggregation_location.split('_')[1])
+            if edge_idx < args.num_edges:
+                edge_agg_decision[edge_idx] = 1
+        except (IndexError, ValueError):
+            # 如果边缘节点ID格式不正确，则安全地回退到云聚合
+            print(f"警告: 边缘节点ID '{aggregation_location}' 格式不正确，回退到云聚合。")
+            cloud_agg_decision = 1
+
     raw_decisions = {
         'local_train': np.ones(len(selected_clients)),  # 全部为本地训练
-        'edge_train': np.zeros(len(selected_clients) * len(edge_nodes) if edge_nodes else 0),
-        'edge_agg': np.zeros(len(edge_nodes)) if edge_nodes else np.array([]),
-        'cloud_agg': np.array([0 if edge_nodes else 1]),  # 如果有边缘节点则用边缘聚合，否则用云聚合
-        'resource_alloc': np.ones(len(selected_clients))  # 默认分配满资源
+        'edge_train': np.zeros(args.num_clients * args.num_edges),
+        'edge_agg': edge_agg_decision,
+        'cloud_agg': np.array(cloud_agg_decision),
+        'resource_alloc': np.zeros(args.num_clients * args.num_edges)  # 默认本地训练，边缘无资源分配
     }
     
     return training_args, raw_decisions
 
-def parse_drl_decisions(action, env, server, clients_manager):
-    """解析DRL决策并生成训练参数"""
-    training_args, raw_decisions = env.get_fl_training_params(action, clients_manager, server)
-    
-    # 确保local_training_clients只包含普通客户端
-    if 'selected_nodes' in training_args:
-        training_args['selected_nodes'] = [
-            node_id for node_id in training_args['selected_nodes'] 
-            if node_id in clients_manager.clients and not clients_manager.clients[node_id].is_edge
-        ]
-    
-    return training_args, raw_decisions
-    
 def _log_round_stats(round_idx, episode_idx, args, training_args, raw_decisions, info, reward, accuracy, loss, server):
     """记录并打印一轮的统计信息"""
     
@@ -137,7 +147,7 @@ def _log_round_stats(round_idx, episode_idx, args, training_args, raw_decisions,
     total_energy = info.get("total_energy", 0.0)
     total_cost = info.get("total_cost", 0.0)
     
-    print(f"\n===== DRL Episode {episode_idx}, FL轮次 {round_idx+1} 结果 =====")
+    print(f"\n===== DRL Episode {episode_idx}, FL轮次 {round_idx} 结果 =====")
     print(f"参与训练的终端设备数量: {len(terminal_devices)}")
     print(f"  - 本地训练数量: {local_train_count}")
     print(f"  - 边缘训练数量: {edge_train_count}")
@@ -181,7 +191,7 @@ def finalize_training(server, global_model, test_loader, args, training_stats, d
     print("=" * 50)
     
     # 最终评估 - 使用服务器的evaluate方法
-    acc = server.evaluate(test_loader)
+    acc, _ = server.evaluate(test_loader)
     print(f"最终准确率: {acc:.4f}")
     
     # 保存最终模型
@@ -256,7 +266,7 @@ def init_system(args):
     print("初始化系统...")
     
     # 1. 创建环境
-    env = Env(num_devices=args.num_clients, num_edges=args.num_edges)
+    env = Env(num_devices=args.num_clients, num_edges=args.num_edges, energy_threshold=args.energy_threshold)
     print(f"创建环境: 终端设备={env.N}, 边缘节点={env.M}")
     
     # 在加载数据集部分之前添加：
@@ -292,21 +302,22 @@ def init_system(args):
     global_model = create_model(model_name)
     global_model = global_model.to(device)
     
-    # 4. 创建客户端管理器 - 使用环境预分配的数据集
-    disable_progress_bar = bool(args.disable_progress_bar)
+    # 4. 创建客户端管理器 - 现在只进行基本初始化
     clients_manager = ClientsGroup(
-        args.dataset, 
-        bool(args.iid), 
-        args.num_clients,
-        args.device,
+        dataset_name=args.dataset, 
+        is_iid=bool(args.iid), 
+        num_clients=args.num_clients,
+        device=device,
         num_edges=args.num_edges,
-        non_iid_level=args.non_iid_level,
-        disable_progress_bar=disable_progress_bar,
-        env_datasets=env_datasets  # 传入环境预分配的数据集
+        non_iid_level=args.non_iid_level
     )
+    
+    # 5. 使用由Env准备好的数据来设置客户端的基础设施
+    clients_manager.setup_infrastructure(data_dict=env_datasets, test_data=test_loader.dataset)
+    
     print(f"创建客户端管理器: 客户端数量={args.num_clients}, 边缘节点数量={args.num_edges}, {'IID' if args.iid else f'非IID-L{args.non_iid_level}'} 数据分布")
     
-    # 5. 创建服务器
+    # 6. 创建服务器
     server_args = {
         'device': device,
         'learning_rate': args.lr,
@@ -316,24 +327,24 @@ def init_system(args):
         'batch_size': args.batch_size,
         'val_freq': 1,  # 每轮评估
         'save_freq': 5,  # 每5轮保存
-        'disable_progress_bar': disable_progress_bar  # 传递进度条禁用参数
+        'disable_progress_bar': bool(args.disable_progress_bar)  # 传递进度条禁用参数
     }
     server = FederatedServer(server_args, global_model, clients_manager)
     print("创建服务器")
     
-    # 6. 为环境设置客户端和服务器
+    # 7. 为环境设置客户端和服务器
     env.set_clients_and_server(clients_manager, server)
     
     # server.env 已在 FederatedServer.__init__ 中声明，无需额外赋值
 
-    # 7. 创建DRL智能体
+    # 8. 创建DRL智能体
     drl_agent = create_drl_agent(args, env)
     if args.drl_load:
         drl_agent.load_model(args.drl_load)
         print(f"加载DRL模型: {args.drl_load}")
     print(f"创建DRL智能体: {args.drl_algo.upper()}")
     
-    # 8. 同步客户端状态与环境
+    # 9. 同步客户端状态与环境
     clients_manager.update_client_states(env)
     print("同步客户端状态与环境")
     
@@ -349,6 +360,15 @@ def main():
 
     # 设置随机种子
     set_seed(args.seed)
+    
+    # GPU优化设置
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # 加速卷积运算
+        torch.backends.cudnn.deterministic = False  # 允许非确定性以获得更好性能
+        # 设置GPU内存分配策略
+        torch.cuda.empty_cache()  # 清空GPU缓存
+        print(f"GPU加速已启用: {torch.cuda.get_device_name()}")
+        print(f"可用GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
     # 初始化系统组件
     env, global_model, test_loader, clients_manager, server, drl_agent = init_system(args)
@@ -390,10 +410,9 @@ def main():
             episode_pbar.set_description(f"Episode {episode_idx}/{args.num_episodes}")
             print(f"\n===== 开始 DRL Episode {episode_idx}/{args.num_episodes} =====")
 
-            # 为新的Episode重置联邦学习模型，开始全新的FL流程
-            print("为新的Episode重置联邦学习模型...")
-            server.model = create_model(server.args['model_name']).to(server.dev)
-            server.global_parameters = server.model.state_dict()
+            # 为新的Episode重置服务器状态和联邦学习模型
+            print("为新的Episode重置服务器和联邦学习模型...")
+            server.reset_for_new_episode()
             
             # 重置环境状态
             state = env.reset()
@@ -407,29 +426,56 @@ def main():
             # 2. 内层循环：在当前Episode内执行FL轮次
             for episode_round in range(args.num_rounds):
                 round_start_time = time.time()
+                global_round_idx += 1 # 统一在循环开始时递增，使其从1开始
                 
-                # a. DRL 决策
-                if global_round_idx > 0:
-                    action = drl_agent.get_action(state)
-                    training_args, raw_decisions = parse_drl_decisions(action, env, server, clients_manager)
+                # a. DRL 决策 - 根据是否为第一轮进行判断
+                if global_round_idx == 1:
+                    # 第一轮使用默认参数
+                    training_args, raw_decisions = _get_default_training_params(clients_manager, args)
+                    # 创建元组格式的默认动作 (discrete_action_tuple, continuous_action_matrix)
+                    # 这个默认动作主要用于drl_agent.learn记录，实际决策在env.step中使用了raw_decisions
+                    # 新动作空间的默认动作
+                    default_discrete_action = (
+                        np.ones(env.N, dtype=int),        # 所有设备本地训练
+                        np.zeros(env.N, dtype=int),       # 边缘选择(无效，因为本地训练=1)
+                        0                                 # 聚合选择edge_0
+                    )
+                    action = (default_discrete_action, np.zeros((env.N, env.M), dtype=np.float32))
                 else:
-                    training_args, raw_decisions = _get_default_training_params(clients_manager)
-                    action = np.zeros(env.action_dim)
+                    # 后续轮次使用DRL智能体决策
+                    action = drl_agent.get_action(state)
+                    # 直接调用env的核心方法来解析动作并获取训练参数
+                    training_args, raw_decisions = env.get_fl_training_params(action, clients_manager, server)
                 
-                # b. 执行联邦学习训练
-                client_edge_mapping = {}
-                if 'edge_client_mapping' in raw_decisions:
-                    client_edge_mapping = raw_decisions['edge_client_mapping']
+                # b. 执行联邦学习训练 - 增加动作有效性检查
+                is_action_valid = env.is_action_valid(raw_decisions, episode_idx, global_round_idx)
 
-                accuracy, global_test_loss, global_training_loss, _, _, _ = server.train_round(
-                    local_training_clients=training_args['selected_nodes'],
-                    client_edge_mapping=client_edge_mapping,
-                    resource_allocation=training_args['resource_allocation'],
-                    aggregation_location=training_args['aggregation_location']
-                )
+                if is_action_valid:
+                    # 动作有效，正常执行FL训练
+                    client_edge_mapping = {}
+                    if 'edge_client_mapping' in raw_decisions:
+                        client_edge_mapping = raw_decisions['edge_client_mapping']
+
+                    accuracy, global_test_loss, global_training_loss, _, _, _, is_fl_converged = server.train_round(
+                        local_training_clients=training_args['selected_nodes'],
+                        client_edge_mapping=client_edge_mapping,
+                        resource_allocation=training_args['resource_allocation'],
+                        aggregation_location=training_args['aggregation_location'],
+                        test_loader=test_loader
+                    )
+                else:
+                    # 动作无效，跳过FL训练，使用上一轮的性能指标
+                    print("  [Invalid Action] 检测到无效动作，跳过本轮FL训练。")
+                    accuracy = server.last_valid_accuracy
+                    global_test_loss = server.last_valid_test_loss
+                    global_training_loss = server.last_valid_training_loss
+                    # 标记为未收敛
+                    is_fl_converged = False
+                    # 将raw_decisions设为None，以在env.step中触发惩罚
+                    raw_decisions = None
                 
-                # c. 环境步进，传入 全局训练损失 (fl_loss) 以获取核心的 done 标志
-                next_state, reward, episode_done, info = env.step(action, fl_loss=global_training_loss)
+                # c. 环境步进，传入已经解析好的决策和原始动作
+                next_state, reward, episode_done, info = env.step(action, raw_decisions, global_round_idx, episode_idx, global_training_loss)
                 
                 # d. DRL 智能体立即学习
                 if args.drl_train:
@@ -438,8 +484,8 @@ def main():
                 # e. 更新状态
                 state = next_state
                 
-                # f. 记录和打印统计信息
-                _log_round_stats(episode_round, episode_idx, args, training_args, raw_decisions, info, reward, accuracy, global_test_loss, server)
+                # f. 记录和打印统计信息 - 直接传递从1开始的全局轮次
+                _log_round_stats(global_round_idx, episode_idx, args, training_args, raw_decisions, info, reward, accuracy, global_test_loss, server)
 
                 # g. 更新统计数据
                 training_stats['accuracy'].append(accuracy)
@@ -454,38 +500,26 @@ def main():
                 episode_losses.append(global_test_loss)
                 episode_costs.append(info.get('total_cost', 0.0))
 
-                # h. 记录每个FL轮次的详细数据到文件
+                # h. 记录每个FL轮次的详细数据到文件 - 直接使用从1开始的全局轮次
                 log_line = f"{global_round_idx},{reward:.4f},{info.get('total_cost', 0.0):.4f},{global_test_loss:.4f},{accuracy:.4f}\n"
                 with open(round_log_path, "a") as f:
                     f.write(log_line)
 
-                # h. 记录到日志文件 (使用全局轮次索引)
-                # log_training_result(
-                #     "LR", args.lr, global_round_idx, reward, 
-                #     global_test_loss, cost=info.get('total_cost', 0.0)
-                # )
-                # log_training_result(
-                #     "DRL_ALGO", args.drl_algo, global_round_idx, reward, 
-                #     global_test_loss, cost=info.get('total_cost', 0.0)
-                # )
-                # log_training_result(
-                #     "BATCH_SIZE", args.batch_size, global_round_idx, reward, 
-                #     global_test_loss, cost=info.get('total_cost', 0.0)
-                # )
-
-                # 更新全局轮次计数器
-                global_round_idx += 1
-                
-                # 更新Episode进度条的后缀信息
+                # i. 更新Episode进度条的后缀信息
                 episode_pbar.set_postfix({
                     'FL Round': f"{episode_round+1}/{args.num_rounds}",
                     'Test Loss': f"{global_test_loss:.4f}", 'Acc': f"{accuracy:.4f}", 
                     'Reward': f"{reward:.4f}", 'Done': episode_done
                 })
                 
+                # 如果FL模型收敛，则提前结束当前Episode
+                if is_fl_converged:
+                    print(f"\n===== DRL Episode {episode_idx} 因联邦学习模型收敛而提前结束 (在FL轮次 {episode_round+1}) =====")
+                    break
+
                 # 如果环境报告Episode结束，则提前跳出内层循环
                 if episode_done:
-                    print(f"===== DRL Episode {episode_idx} 因FL模型收敛而提前结束 (在第 {episode_round+1} 轮) =====")
+                    print(f"===== DRL Episode {episode_idx} 因环境信号而提前结束 (在FL轮次 {episode_round+1}) =====")
                     break
 
             # Episode结束后的处理
@@ -505,17 +539,15 @@ def main():
                     log_filename, episode_idx, avg_reward, 
                     avg_loss, cost=avg_cost
                 )
-
             # 更新外层循环(Episode)的进度条
             episode_pbar.update(1)
-    
     # 训练结束，进行最终评估和统计
     return args, finalize_training(server, global_model, test_loader, args, training_stats, drl_agent)
 
 # 在训练结束后，如果需要绘图
 if __name__ == "__main__":
     # 导入绘图模块 - 移到此处以避免循环导入
-    from plot.plot_award import plot_training_results, plot_all_logs, log_episode_result
+    from plot.plot_award import plot_training_results, plot_all_logs
     
     args, final_acc = main()
     

@@ -78,36 +78,35 @@ class PDQNAdapter(DRLAdapter):
             state: 环境状态
             
         Returns:
-            动作向量，扁平化的一维数组
+            动作元组(discrete_action, continuous_action)，其中:
+            - discrete_action是一个多维离散动作向量，代表并行的二元决策
+            - continuous_action是一个连续动作矩阵，形状为(N,M)
         """
         # 确保状态是numpy数组
         if isinstance(state, list):
             state = np.array(state, dtype=np.float32)
         
-        # 使用PDQN智能体获取动作
-        action = self.agent.select_action(state)
-        
-        # 确保返回的是一维numpy数组
-        if not isinstance(action, np.ndarray):
-            action = np.array(action, dtype=np.float32)
-        
-        # 确保动作在正确的范围内
-        action = np.clip(action, 0.0, 1.0)
-        
-        return action
+        # 使用PDQN智能体获取动作 - 返回(discrete_action, continuous_action)元组
+        # discrete_action 是一个向量
+        return self.agent.select_action(state)
     
     def learn(self, state, action, reward, next_state, done):
-        """训练智能体"""
-        # 确保所有输入都是numpy数组
+        """训练智能体
+        
+        Args:
+            state: 环境状态
+            action: 动作元组(discrete_action, continuous_action)
+            reward: 奖励
+            next_state: 下一个状态
+            done: 是否结束
+        """
+        # 确保状态是numpy数组
         if isinstance(state, list):
             state = np.array(state, dtype=np.float32)
-        if isinstance(action, list):
-            action = np.array(action, dtype=np.float32)
         if isinstance(next_state, list):
             next_state = np.array(next_state, dtype=np.float32)
         
-        # 直接存储经验，不需要修改动作向量
-        # PDQNAgent的store方法内部会调用_optimize_td_loss进行学习
+        # 直接将元组格式的动作传递给agent.store方法
         self.agent.store(state, action, reward, next_state, done)
     
     def save_model(self, path):
@@ -141,25 +140,13 @@ class DDPGAdapter(DRLAdapter):
     def get_action(self, state):
         """获取动作"""
         # 获取DDPG原始动作
-        action = self.agent.act(state) if hasattr(self.agent, 'act') else self.agent.select_action(state)
-        
-        # 确保动作是numpy数组
-        if not isinstance(action, np.ndarray):
-            action = np.array(action, dtype=np.float32)
-        
-        # 确保动作在正确的范围内
-        action = np.clip(action, 0.0, 1.0)
-        
-        return action
+        return self.agent.act(state) if hasattr(self.agent, 'act') else self.agent.select_action(state)
     
     def learn(self, state, action, reward, next_state, done):
         """训练智能体"""
-        # 存储经验
+        # 存储经验并学习
         self.agent.store_transition(state, action, reward, next_state, done)
-            
-        # 如果有足够的样本，就进行更新
-        if hasattr(self.agent, 'memory_counter') and self.agent.memory_counter > self.agent.batch_size:
-                self.agent.learn()
+        self.agent.learn()
     
     def save_model(self, path):
         """保存模型"""
@@ -179,17 +166,13 @@ class TD3Adapter(DRLAdapter):
     
     def get_action(self, state):
         """获取动作"""
-        action = self.agent.act(state) if hasattr(self.agent, 'act') else self.agent.select_action(state)
-        return np.clip(action, 0.0, 1.0)
+        return self.agent.act(state) if hasattr(self.agent, 'act') else self.agent.select_action(state)
     
     def learn(self, state, action, reward, next_state, done):
         """训练智能体"""
-        # 存储经验
+        # 存储经验并学习
         self.agent.store_transition(state, action, reward, next_state, done)
-            
-        # 如果有足够的样本，就进行更新
-        if hasattr(self.agent, 'memory_counter') and self.agent.memory_counter > self.agent.batch_size:
-                self.agent.learn()
+        self.agent.learn()
     
     def save_model(self, path):
         """保存模型"""
@@ -209,17 +192,13 @@ class SACAdapter(DRLAdapter):
     
     def get_action(self, state):
         """获取动作"""
-        action = self.agent.act(state) if hasattr(self.agent, 'act') else self.agent.select_action(state)
-        return np.clip(action, 0.0, 1.0)
+        return self.agent.act(state) if hasattr(self.agent, 'act') else self.agent.select_action(state)
     
     def learn(self, state, action, reward, next_state, done):
         """训练智能体"""
-        # 存储经验
+        # 存储经验并学习
         self.agent.store_transition(state, action, reward, next_state, done)
-            
-        # 如果有足够的样本，就进行更新
-        if hasattr(self.agent, 'memory_counter') and self.agent.memory_counter > self.agent.batch_size:
-                self.agent.learn()
+        self.agent.learn()
     
     def save_model(self, path):
         """保存模型"""
@@ -239,15 +218,12 @@ class PPOAdapter(DRLAdapter):
     
     def get_action(self, state):
         """获取动作"""
-        action = self.agent.act(state) if hasattr(self.agent, 'act') else self.agent.select_action(state)
-        return np.clip(action, 0.0, 1.0)
+        return self.agent.act(state) if hasattr(self.agent, 'act') else self.agent.select_action(state)
     
     def learn(self, state, action, reward, next_state, done):
         """训练智能体"""
-        # PPO是on-policy，每个时间步都存储经验
+        # 存储经验并学习
         self.agent.store_transition(state, action, reward, next_state, done)
-        
-        # PPO agent内部有自己的逻辑决定何时学习 (例如，当缓冲区满时)
         self.agent.learn()
     
     def save_model(self, path):
@@ -272,7 +248,7 @@ class A3CAdapter(DRLAdapter):
     
     def learn(self, state, action, reward, next_state, done):
         """训练智能体"""
-        # A3C是on-policy且通常是异步的，每个worker直接使用经验学习
+        # 直接学习
         self.agent.learn(state, action, reward, next_state, done)
     
     def save_model(self, path):
@@ -306,25 +282,26 @@ def create_drl_agent(args, env, **kwargs):
         
         # 将命令行参数映射到PDQN的参数字典
         pdqn_params = {
-            'batch_size': args.drl_batch_size,
+            'batch_size': min(args.drl_batch_size, 256),  # 限制批次大小，提高学习稳定性
             'gamma': args.drl_gamma,
             'replay_memory_size': args.drl_memory_size,
-            'learning_rate_actor': args.drl_lr,
+            'learning_rate_actor': args.drl_lr * 0.5,    # 降低学习率，提高收敛稳定性
             
             # 保留部分固定参数
             'inverting_gradients': True, # 使用梯度反转方案
-            'initial_memory_threshold': 128,  # 开始学习所需的转换数量
+            'initial_memory_threshold': 32,   # 进一步降低，更早开始学习
             'use_ornstein_noise': True,  # 使用Ornstein噪声
-            'epsilon_steps': 100,        # 线性衰减epsilon的episode数量
-            'epsilon_final': 0.01,      # 最终epsilon值
-            'tau_actor': 0.05,       # 软目标网络更新因子
-            'tau_actor_param': 0.01, # 参数Actor网络软更新因子
-            'learning_rate_actor_param': 0.0005,  # 参数Actor网络学习率
-            'clip_grad': 1.0,                     # 参数梯度裁剪限制
+            'epsilon_steps': 30,         # 更快衰减，在30个episode内从探索转向利用
+            'epsilon_final': 0.02,       # 最终保持很小的探索率
+            'tau_actor': 0.01,       # 降低软更新率，提高稳定性
+            'tau_actor_param': 0.005, # 进一步降低参数网络更新率
+            'clip_grad': 1.0,        # 梯度裁剪，防止梯度爆炸
             'zero_index_gradients': False,        # 是否将不对应所选动作的动作参数的所有梯度归零
         }
         
-        # 创建PDQN智能体
+        # 创建PDQN智能体 - 注意这里的action_space是一个复合空间
+        # 它包含离散动作空间和连续动作参数空间
+        print(f"PDQN智能体使用复合动作空间: {env.action_space}")
         agent = PDQNAgent(env.observation_space, env.action_space, 
                 actor_class=QActor, 
                 actor_param_class=ParamActor,
@@ -334,134 +311,9 @@ def create_drl_agent(args, env, **kwargs):
                 **pdqn_params)
         return PDQNAdapter(agent, env)
     
-    elif algorithm == 'ddpg':
-        # 导入DDPG实现
-        from elsedrl import DDPG
-        
-        # DDPG优化参数配置
-        ddpg_params = {
-            'batch_size': 256,              # 批次大小
-            'gamma': 0.99,                  # 折扣因子
-            'tau': 0.005,                   # 软更新系数
-            'buffer_size': 20000,           # 经验回放缓冲区大小
-            'learning_rate_actor': 0.0001,  # Actor学习率
-            'learning_rate_critic': 0.001,  # Critic学习率
-            'hidden_sizes': [256, 256],     # 隐藏层大小
-        }
-        
-        # 更新默认参数
-        for key, value in ddpg_params.items():
-            if key not in kwargs:
-                kwargs[key] = value
-        
-        # 创建DDPG智能体
-        agent = DDPG(env.observation_space, env.action_space, **kwargs)
-        return DDPGAdapter(agent, env)
-    
-    elif algorithm == 'td3':
-        # 导入TD3实现
-        from elsedrl import TD3
-        
-        # TD3优化参数配置
-        td3_params = {
-            'batch_size': 256,              # 批次大小
-            'gamma': 0.99,                  # 折扣因子
-            'tau': 0.005,                   # 软更新系数
-            'buffer_size': 20000,           # 经验回放缓冲区大小
-            'learning_rate_actor': 0.0001,  # Actor学习率
-            'learning_rate_critic': 0.001,  # Critic学习率
-            'policy_noise': 0.2,            # 策略噪声
-            'noise_clip': 0.5,              # 噪声裁剪
-            'policy_delay': 2,              # 策略更新延迟
-            'hidden_sizes': [256, 256],     # 隐藏层大小
-        }
-        
-        # 更新默认参数
-        for key, value in td3_params.items():
-            if key not in kwargs:
-                kwargs[key] = value
-        
-        # 创建TD3智能体
-        agent = TD3(env.observation_space, env.action_space, **kwargs)
-        return TD3Adapter(agent, env)
-    
-    elif algorithm == 'sac':
-        # 导入SAC实现
-        from elsedrl import SAC
-        
-        # SAC优化参数配置
-        sac_params = {
-            'batch_size': 256,              # 批次大小
-            'gamma': 0.99,                  # 折扣因子
-            'tau': 0.005,                   # 软更新系数
-            'buffer_size': 20000,           # 经验回放缓冲区大小
-            'learning_rate_actor': 0.0003,  # Actor学习率
-            'learning_rate_critic': 0.0003, # Critic学习率
-            'learning_rate_alpha': 0.0003,  # 温度参数学习率
-            'hidden_sizes': [256, 256],     # 隐藏层大小
-            'alpha': 0.2,                   # 初始温度参数
-            'auto_entropy': True,           # 自动调整熵正则化系数
-        }
-        
-        # 更新默认参数
-        for key, value in sac_params.items():
-            if key not in kwargs:
-                kwargs[key] = value
-        
-        # 创建SAC智能体
-        agent = SAC(env.observation_space, env.action_space, **kwargs)
-        return SACAdapter(agent, env)
-    
-    elif algorithm == 'ppo':
-        # 导入PPO实现
-        from elsedrl import PPO
-        
-        # PPO优化参数配置
-        ppo_params = {
-            'batch_size': 64,               # 批次大小
-            'gamma': 0.99,                  # 折扣因子
-            'clip_param': 0.2,              # 裁剪参数
-            'gae_lambda': 0.95,             # GAE lambda参数
-            'learning_rate': 0.0003,        # 学习率
-            'value_loss_coef': 0.5,         # 价值损失系数
-            'entropy_coef': 0.01,           # 熵正则化系数
-            'max_grad_norm': 0.5,           # 梯度裁剪
-            'num_mini_batch': 4,            # mini-batch数量
-            'ppo_epoch': 10,                # PPO更新轮数
-            'hidden_sizes': [64, 64],       # 隐藏层大小
-        }
-        
-        # 更新默认参数
-        for key, value in ppo_params.items():
-            if key not in kwargs:
-                kwargs[key] = value
-        
-        # 创建PPO智能体
-        agent = PPO(env.observation_space, env.action_space, **kwargs)
-        return PPOAdapter(agent, env)
-    
-    elif algorithm == 'a3c':
-        # 导入A3C实现
-        from elsedrl import A3C
-        
-        # A3C优化参数配置
-        a3c_params = {
-            'gamma': 0.99,                  # 折扣因子
-            'learning_rate': 0.0001,        # 学习率
-            'value_loss_coef': 0.5,         # 价值损失系数
-            'entropy_coef': 0.01,           # 熵正则化系数
-            'max_grad_norm': 40,            # 梯度裁剪
-            'hidden_sizes': [128, 128],     # 隐藏层大小
-        }
-        
-        # 更新默认参数
-        for key, value in a3c_params.items():
-            if key not in kwargs:
-                kwargs[key] = value
-        
-        # 创建A3C智能体
-        agent = A3C(env.observation_space, env.action_space, **kwargs)
-        return A3CAdapter(agent, env)
+    elif algorithm in ['ddpg', 'td3', 'sac', 'ppo', 'a3c']:
+        # 这些算法不是本项目的重点，提示使用PDQN
+        raise ValueError(f"请使用PDQN算法代替{algorithm.upper()}，其它算法尚未完全支持")
     
     else:
         raise ValueError(f"不支持的DRL算法: {algorithm}") 

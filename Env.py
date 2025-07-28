@@ -37,7 +37,7 @@ class LyapunovQueue:
 
 class Env:
     """环境类 - 提供状态、动作、奖励计算"""
-    def __init__(self, num_devices, num_edges):
+    def __init__(self, num_devices, num_edges, energy_threshold=500):
         # 系统参数
         self.N = num_devices        # 终端设备数量
         self.M = num_edges         # 边缘服务器数量
@@ -107,46 +107,48 @@ class Env:
         # 状态空间
         # 每个终端设备状态: 5个基本状态 + M个上行速率 + M个下行速率
         # 每个边缘节点状态: 1个计算资源 + 2个与云的传输速率
-        self.state_dim = 5*self.N + 2*self.N*self.M + 2*self.M  # 修正为正确的计算公式
+        # 修正：状态维度应为 5*N (设备) + 2*N*M (设备-边缘通信) + 3*M (边缘节点状态)
+        # ★★★ 新增：添加模型性能和参数变化量到状态空间 ★★★
+        self.state_dim = 5*self.N + 2*self.N*self.M + 3*self.M + 3 # +2 for loss/acc, +1 for model delta
         print(f"计算的状态维度: {self.state_dim} (N={self.N}, M={self.M})")
 
-        # 动作空间：
-        # 1. 训练决策: 
-        #    - x_i^l(t): N个二元变量，表示设备i是否在本地训练
-        #    - y_(i,m)^e(t): N*M个二元变量，表示设备i是否在边缘节点m上训练
-        # 2. 聚合决策:
-        #    - z_m^e(t): M个二元变量，表示是否在边缘节点m上聚合
-        #    - w^c(t): 1个二元变量，表示是否在云端聚合
-        # 3. 资源分配:
-        #    - f_(i,m)^e(t): N*M个连续变量，表示为边缘节点m上的设备i分配的计算资源
-
-        # 计算动作空间维度
-        self.train_dim = self.N * (1 + self.M)  # x_i^l(t) + y_(i,m)^e(t)
-        self.agg_dim = self.M + 1                # z_m^e(t) + w^c(t) - 修改为一个全局聚合决策
-        self.res_dim = self.N * self.M             # f_(i,m)^e(t)
-        self.action_dim = self.train_dim + self.agg_dim + self.res_dim
-
-        # 修改为复合动作空间
+        # === 新动作空间设计：独立的并行二元决策 ===
+        # 新动作空间设计：天然满足约束
+        # 1. 本地训练决策：N维，每个设备0(卸载)或1(本地)
+        # 2. 边缘训练决策：N维，每个设备选择边缘节点编号(0到M-1)，仅当本地训练=0时有效
+        # 3. 聚合决策：1维，选择聚合节点编号(0到M，0到M-1为边缘，M为云)
+        
+        # 为了兼容PDQN，保留维度属性
+        self.train_dim = self.N                # 本地训练决策维度
+        self.edge_train_dim = self.N           # 边缘训练决策维度 (新设计)
+        self.edge_agg_dim = 1                  # 聚合决策维度 (新设计)
+        self.cloud_agg_dim = 0                 # 云聚合包含在聚合决策中
+        
         self.action_space = spaces.Tuple([
-            # 离散部分：44维
-            spaces.MultiDiscrete([2] * self.train_dim + [2] * self.agg_dim),
-            # 连续部分：30维
+            # 离散部分：天然满足约束的动作设计
+            spaces.Tuple((
+                spaces.MultiDiscrete([2] * self.N),               # 1. 本地训练决策 (0或1)
+                spaces.MultiDiscrete([self.M] * self.N),          # 2. 边缘训练决策 (0到M-1)
+                spaces.Discrete(self.M + 1)                       # 3. 聚合决策 (0到M，M为云)
+            )),
+            # 连续部分：资源分配矩阵
             spaces.Box(low=0, high=1, shape=(self.N, self.M), dtype=np.float32)
         ])
-
-        # 保留原始的扁平化维度信息用于调试
-        discrete_dim = self.train_dim + self.agg_dim  # 44维
-        continuous_dim = self.res_dim  # 30维
-        print(f"环境动作空间: 总维度={discrete_dim + continuous_dim}, 离散部分={discrete_dim}, 连续部分={continuous_dim}")
+        
+        print(f"新动作空间: 本地训练{self.N}维(0/1), 边缘训练{self.N}维(0-{self.M-1}), 聚合1维(0-{self.M}), 资源分配({self.N}×{self.M})")
         
         # Lyapunov参数
-        self.energy_max = 2500  # 所有设备统一阈值
+        self.energy_max = energy_threshold  # 使用可配置的阈值
         self.e_avg = self.energy_max  # 移除平均计算
         self.alpha = 0.5  # 延迟权重
         self.beta = 0.5  # 能耗权重
         #self.reward_bate = 20.0  # 奖励系数 (显著提高以平衡奖励信号)
         self.convergence_epsilon = 1e-3  # 新的收敛阈值: F(ωt) - F(ω*) <= ϵ
         self.best_loss = float('inf')    # 记录当前episode的最优损失
+        
+        # --- 新增：奖励归一化参数 ---
+        self.max_cost_per_round = 200.0  # 预估的单轮最大成本
+        self.max_q_energy_per_round = 1000.0 # 预估的单轮最大队列能量项
         
         # 修改为每个设备独立的队列
         self.queues = [LyapunovQueue(e_avg=self.energy_max) for _ in range(self.N)]  # 统一阈值
@@ -193,6 +195,73 @@ class Env:
             os.makedirs("logs")
         with open(self.invalid_log_file, 'w') as f:
             f.write(f"===== Invalid Action Log - New Experiment Started at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+
+    def _meets_constraints(self, train_local_decisions, edge_train_matrix, edge_agg_decision, 
+                          cloud_agg_decision, res_alloc_matrix):
+        """
+        简化的约束检查：新动作空间天然满足大部分约束，只需检查资源约束
+        """
+        penalty = 0.0
+        invalid_reasons = []
+        
+        # 约束：边缘节点资源约束 - 资源分配不能超过上限
+        for j in range(self.M):
+            total_ratio = 0.0
+            for i in range(self.N):
+                if edge_train_matrix[i, j] == 1:
+                    # 累加分配给边缘节点j的资源比例
+                    total_ratio += min(max(res_alloc_matrix[i, j], 0), 1)
+            
+            if total_ratio > 1.0 + 1e-6:  # 添加浮点数容差
+                # 资源超限惩罚
+                overuse_amount = total_ratio - 1.0
+                penalty += 150.0 + 300.0 * overuse_amount
+                invalid_reasons.append(f"边缘节点{j}资源分配超限: 分配比例总和 {total_ratio:.6f} > 1.0")
+        
+        return penalty > 0.0, invalid_reasons
+
+
+    def is_action_valid(self, raw_decisions, episode_idx, global_round_idx):
+        """
+        检查解析后的动作是否有效，并记录无效原因。
+        """
+        if raw_decisions is None:
+            self.log_invalid_action(episode_idx, global_round_idx, ["动作解析结果为None"])
+            return False
+
+        train_local = raw_decisions.get('local_train', np.zeros(self.N))
+        edge_train_flat = raw_decisions.get('edge_train', np.zeros(self.N * self.M))
+        edge_agg = raw_decisions.get('edge_agg', np.zeros(self.M))
+        cloud_agg = raw_decisions.get('cloud_agg', 0)
+        res_alloc = raw_decisions.get('resource_alloc', np.zeros(self.N * self.M))
+
+        edge_train_matrix = np.array(edge_train_flat).reshape((self.N, self.M))
+        res_alloc_matrix = np.array(res_alloc).reshape((self.N, self.M))
+
+        is_invalid, reasons = self._meets_constraints(
+            train_local.astype(int),
+            edge_train_matrix,
+            edge_agg.astype(int),
+            int(cloud_agg),
+            res_alloc_matrix
+        )
+
+        if is_invalid:
+            self.log_invalid_action(episode_idx, global_round_idx, reasons)
+        
+        return not is_invalid
+
+    def log_invalid_action(self, episode_idx, global_round_idx, reasons):
+        """记录无效动作到日志文件"""
+        with open(self.invalid_log_file, 'a') as f:
+            log_entry = (
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"Episode: {episode_idx}, Global FL Round: {global_round_idx}\n"
+            )
+            log_entry += "  Reasons for invalid action:\n"
+            for reason in reasons:
+                log_entry += f"    - {reason}\n"
+            f.write(log_entry + "\n")
 
 
     #无线通道模型，计算传输速率
@@ -258,14 +327,13 @@ class Env:
         return initial_state
         
     def _get_state(self):
-        """构建符合MEC联邦学习需求的状态空间"""
+        """构建符合MEC联邦学习需求的状态空间 - 基于李雅普诺夫队列理论"""
         global_state = []
             
+        # 李雅普诺夫队列状态 - 这是论文中的核心状态变量
+        lyapunov_queues = np.zeros(self.N)
+        
         for i in range(self.N):
-            # 初始化队列积压和剩余能量
-            queue_backlogs = np.zeros(self.N)
-            remaining_energies = np.zeros(self.N)
-            
             # 计算上下行速率
             for j in range(self.M):
                 self.R_up[i][j] = self.calculate_rate(
@@ -280,21 +348,17 @@ class Env:
                     self.N0
                 )
 
-            # 使用设备i的队列积压
+            # 李雅普诺夫队列状态：Q_i(t) - 这是论文中的状态变量
             if i < len(self.queues):
-                queue_backlogs[i] = self.queues[i].queue / self.energy_max
+                lyapunov_queues[i] = self.queues[i].queue / self.energy_max  # 归一化处理
             
-            # 计算设备i的剩余能量
-            if i < len(self.queues):
-                remaining_energies[i] = max(0, self.energy_max - self.queues[i].queue)
-            
-            # 基本状态 - 5个元素/设备，总共5*N个元素
+            # 基于李雅普诺夫队列的状态 - 每个设备5个元素，总共5*N个元素
             device_state = [
                 float(self.data_sizes[i]) / (100.0 * 1024 * 1024),  # 数据大小(归一化)
                 float(self.model_sizes[i]) / (10.0 * 1024 * 1024),  # 模型大小(归一化)
-                float(queue_backlogs[i]),                           # 队列积压
+                float(lyapunov_queues[i]),                          # 李雅普诺夫队列状态 Q_i(t) - 论文中的核心状态
                 float(self.f_l[i]) / 3e9 if isinstance(self.f_l, np.ndarray) and i < len(self.f_l) else 0.0,  # 设备CPU频率(归一化)
-                float(remaining_energies[i]) / self.energy_max      # 剩余能量比例
+                float(lyapunov_queues[i])                           # 李雅普诺夫队列状态的二次项 (用于李雅普诺夫函数计算)
             ]
             
             global_state.extend(device_state)
@@ -314,6 +378,18 @@ class Env:
             # 添加边缘节点当前分配的计算资源
             global_state.append(self.f_e[j] / 4.5e9)   # 当前分配的计算资源(归一化)
         
+        # ★★★ 新增：添加模型性能到状态向量 ★★★
+        if self.server is not None:
+            global_state.append(self.server.last_valid_test_loss)
+            global_state.append(self.server.last_valid_accuracy)
+            # 添加模型参数变化量 (归一化)
+            global_state.append(min(self.server.best_delta / 10.0, 1.0)) # 用10.0作为归一化因子
+        else:
+            # 初始状态下，性能指标为默认值
+            global_state.append(1.0) # 初始损失
+            global_state.append(0.1) # 初始准确率
+            global_state.append(1.0) # 初始模型变化量
+
         state = np.array(global_state, dtype=np.float32)
         print(f"状态向量长度: {len(state)}")
         
@@ -479,73 +555,29 @@ class Env:
             
             return delay, energy
 
-    def _meets_constraints(self, train_local_decisions, edge_train_matrix, edge_agg_decision, 
-                          cloud_agg_decision, res_alloc_matrix):
-        
-        penalty = 0.0
-        invalid_reasons = []
-        
-        # 约束1: 训练位置唯一性 - 每个设备必须且只能在一个位置训练
-        for i in range(self.N):
-            local_decision = train_local_decisions[i]
-            edge_sum = np.sum(edge_train_matrix[i])
-            # 检查是否未分配训练位置
-            if (local_decision + edge_sum) == 0:
-                penalty += 800.0  # 未分配训练位置惩罚
-                invalid_reasons.append(f"设备{i}未被分配训练位置")
-            
-            # 检查是否分配了多个训练位置
-            if (local_decision + edge_sum) > 1:
-                penalty += 300.0  # 相对较低的惩罚
-                invalid_reasons.append(f"设备{i}被分配到多个训练位置")
-           
-
-        # 约束2: 聚合位置唯一性 - 必须且只能选择一个聚合位置
-        edge_agg_sum = np.sum(edge_agg_decision)
-        if (edge_agg_sum + cloud_agg_decision) != 1:
-            penalty += 300.0  # 聚合位置冲突/缺失惩罚
-            invalid_reasons.append("聚合位置约束违反")
-
-        # 如果选择了多个边缘节点进行聚合
-        if edge_agg_sum > 1:
-            penalty += 150.0 * (edge_agg_sum - 1)  # 多选聚合节点惩罚
-
-        # 约束3: 边缘节点资源约束 - 资源分配不能超过上限
-        for j in range(self.M):
-            total_alloc = 0.0
-            for i in range(self.N):
-                if edge_train_matrix[i, j] == 1:
-                    # 安全地计算分配的资源
-                    alloc_ratio = min(max(res_alloc_matrix[i, j], 0), 1)
-                    actual_freq = self.f_e_min + alloc_ratio * (self.f_e_max - self.f_e_min)
-                    total_alloc += actual_freq
-            
-            if total_alloc > self.F_e[j]:
-                # 资源超限惩罚
-                overuse_ratio = total_alloc / self.F_e[j] - 1
-                penalty += 150.0 + 300.0 * overuse_ratio
-                invalid_reasons.append(f"边缘节点{j}资源分配超限: {total_alloc/1e9:.2f}GHz > {self.F_e[j]/1e9:.2f}GHz")
-        
-        return penalty, invalid_reasons
-
     def parse_action(self, action):
         """
-        解析扁平化的动作数组为离散和连续部分
+        解析动作为离散和连续部分
         
         Args:
-            action: 扁平化的动作数组
+            action: 元组(discrete_action, continuous_action)，其中discrete_action是一个整数索引
         
         Returns:
-            discrete_action: 离散动作部分
-            continuous_action: 连续动作部分
+            discrete_action: 离散动作部分 - 整数索引
+            continuous_action: 连续动作部分 - 数组
         """
-        # 确保动作是numpy数组
+        # 如果是元组格式(discrete_action, continuous_action)，直接返回
+        if isinstance(action, tuple) and len(action) == 2:
+            discrete_action, continuous_action = action
+            return discrete_action, continuous_action
+        
+        # 为了向后兼容，保留对扁平化数组的支持
         if not isinstance(action, np.ndarray):
             action = np.array(action)
         
         # 分割动作数组
-        discrete_dim = self.train_dim + self.agg_dim
-        continuous_dim = self.res_dim
+        discrete_dim = self.train_dim + self.edge_train_dim + self.edge_agg_dim + self.cloud_agg_dim
+        continuous_dim = self.N * self.M
         
         # 确保动作维度正确
         if len(action) < discrete_dim + continuous_dim:
@@ -566,7 +598,8 @@ class Env:
         这是一个内部方法，被step和get_fl_training_params共同使用
         
         Args:
-            action: DRL智能体输出的动作向量
+            action: DRL智能体输出的动作，元组(discrete_action_idx, continuous_action)
+                   其中discrete_action_idx是整数索引，指示哪个决策选项
             clients_manager: 客户端管理器实例（可选）
             server: 服务器实例（可选）
             
@@ -592,27 +625,38 @@ class Env:
                 cid for cid in clients_manager.clients
                 if clients_manager.clients[cid].available and cid.startswith("edge")]
         
-        # 解析动作
-        discrete_action, continuous_action = self.parse_action(action)
+        # 解析动作 - parse_action应该返回 (决策向量, 连续矩阵)
+        discrete_action_tuple, continuous_action = self.parse_action(action)
         
-        # 1. 解析训练决策
-        # 1.1 解析本地训练决策
-        train_local_decisions = discrete_action[:min(self.N, len(discrete_action))]  # x_i^l(t)
+        # === 新动作空间解码器：天然满足约束的动作解析 ===
+        local_train_binary = discrete_action_tuple[0]        # N维，每个设备0/1
+        edge_selection_indices = discrete_action_tuple[1]    # N维，每个设备选择边缘节点0到M-1
+        aggregation_choice = discrete_action_tuple[2]        # 1维，聚合选择0到M (M为云)
+
+        # 基于新动作空间构建训练决策
+        train_local_decisions = np.array(local_train_binary, dtype=int)
         
-        # 1.2 解析边缘训练决策
-        edge_train_offset = self.N
-        edge_train_decisions = discrete_action[edge_train_offset:edge_train_offset + self.N * self.M]
+        # 构建边缘训练矩阵：只有当本地训练=0时，边缘选择才有效
+        edge_train_decisions = np.zeros(self.N * self.M, dtype=int)
+        for i in range(self.N):
+            if local_train_binary[i] == 0:  # 如果不本地训练
+                # 使用np.rint和clip确保edge_idx在有效范围内
+                edge_idx = int(np.rint(np.clip(edge_selection_indices[i], 0, self.M-1)))
+                flat_idx = i * self.M + edge_idx
+                edge_train_decisions[flat_idx] = 1
         
-        # 1.3 解析聚合决策
-        edge_agg_offset = edge_train_offset + self.N * self.M
-        edge_agg_decisions = discrete_action[edge_agg_offset:edge_agg_offset + self.M]
-        
-        cloud_agg_offset = edge_agg_offset + self.M
-        cloud_agg_decisions = discrete_action[cloud_agg_offset:cloud_agg_offset + 1]
-        cloud_agg_decision = cloud_agg_decisions[0] if len(cloud_agg_decisions) > 0 else 0
-        
-        # 1.4 解析资源分配决策
-        res_alloc_flat = continuous_action
+        # 构建聚合决策
+        aggregation_idx = int(np.rint(np.clip(aggregation_choice, 0, self.M)))
+        if aggregation_idx == self.M:  # 云聚合
+            edge_agg_decisions = np.zeros(self.M, dtype=int)
+            cloud_agg_decision = 1
+        else:  # 边缘聚合
+            edge_agg_decisions = np.zeros(self.M, dtype=int)
+            edge_agg_decisions[aggregation_idx] = 1
+            cloud_agg_decision = 0
+
+        # 5. 解析资源分配决策
+        res_alloc_flat = continuous_action.flatten() if hasattr(continuous_action, 'flatten') else np.array(continuous_action).flatten()
         
         # 返回解析结果
         return {
@@ -621,19 +665,35 @@ class Env:
             'edge_agg_decisions': edge_agg_decisions,
             'cloud_agg_decision': cloud_agg_decision,
             'res_alloc_flat': res_alloc_flat,
-            'discrete_action': discrete_action,
+            'discrete_action': (train_local_decisions, edge_train_decisions, edge_agg_decisions, cloud_agg_decision), # 返回元组结构的离散动作
             'continuous_action': continuous_action,
             'available_clients': available_clients,
             'available_edges': available_edges
         }
 
-    def step(self, action, fl_loss=None):
+    def step(self, action, raw_decisions, global_round_idx, episode_idx, fl_loss=None):
         """
         执行一步动作 - 对应一个FL轮次
-        :param action: 扁平化的动作数组
+        :param action: 原始动作元组，用于存储和学习
+        :param raw_decisions: 已经由 get_fl_training_params 解析好的原始决策字典
+        :param global_round_idx: 当前的全局FL轮次索引 (从1开始)
+        :param episode_idx: 当前的DRL Episode索引 (从1开始)
         :param fl_loss: 从服务器传来的全局损失，用于判断收敛
         :return: 新状态，奖励，是否结束当前Episode，附加信息
         """
+        # ★★★ 新增：处理无效动作的情况 ★★★
+        if raw_decisions is None:
+            # 环境随机变化
+            self._randomize_environment()
+            next_state = self._get_state()
+            # 给予一个固定的巨大惩罚
+            total_reward = -1000.0 
+            episode_done = False
+            info = {"total_delay": 0.0, "total_energy": 0.0, "total_cost": 0.0, "valid_ratio": 0.0}
+            # 可以在此处记录无效动作的日志
+            self.log_invalid_action(episode_idx, global_round_idx, ["main.py检测到无效动作"])
+            return next_state, total_reward, episode_done, info
+
         # 初始化信息字典
         info = {
             "total_delay": 0.0,
@@ -642,15 +702,12 @@ class Env:
             "valid_ratio": 0.0
         }
         
-        # 解析动作
-        parsed_action = self._parse_action_for_training(action)
-        
-        # 提取解析结果
-        train_local_decisions = parsed_action['train_local_decisions']
-        edge_train_decisions = parsed_action['edge_train_decisions']
-        edge_agg_decisions = parsed_action['edge_agg_decisions']
-        cloud_agg_decision = parsed_action['cloud_agg_decision']
-        res_alloc_flat = parsed_action['res_alloc_flat']
+        # 提取解析结果 - 直接从传入的raw_decisions获取
+        train_local_decisions = raw_decisions.get('local_train', np.zeros(self.N))
+        edge_train_decisions = raw_decisions.get('edge_train', np.zeros(self.N * self.M))
+        edge_agg_decisions = raw_decisions.get('edge_agg', np.zeros(self.M))
+        cloud_agg_decision = raw_decisions.get('cloud_agg', 0)
+        res_alloc_flat = raw_decisions.get('resource_alloc', np.zeros(self.N * self.M))
         
         # 环境随机变化
         self._randomize_environment()
@@ -662,7 +719,7 @@ class Env:
         for idx in range(valid_indices):
             i = idx // self.M  # 行索引
             j = idx % self.M   # 列索引
-            edge_train_matrix[i, j] = 1 if edge_train_decisions[idx] > 0.5 else 0
+            edge_train_matrix[i, j] = int(edge_train_decisions[idx])
         
         # 将资源分配转换为矩阵形式
         res_alloc_matrix = np.zeros((self.N, self.M))
@@ -675,33 +732,11 @@ class Env:
                     res_alloc_matrix[i, j] = 0.5  # 默认值
                 flat_idx += 1
         
-        # 2. 检查约束
-        # 将所有离散决策转换为0/1二元值再传入约束检查
-        binary_train_local = (train_local_decisions > 0.5).astype(int)
-        binary_edge_agg = (edge_agg_decisions > 0.5).astype(int)
-        binary_cloud_agg = 1 if cloud_agg_decision > 0.5 else 0
-        constraint_penalty, invalid_reasons = self._meets_constraints(
-            binary_train_local, 
-            edge_train_matrix,
-            binary_edge_agg,
-            binary_cloud_agg,
-            res_alloc_matrix
-        )
+        # 2. 检查约束 - 直接使用解析好的决策，不需要再次转换
+        binary_train_local = train_local_decisions.astype(int)
+        binary_edge_agg = edge_agg_decisions.astype(int)
+        binary_cloud_agg = int(cloud_agg_decision)
         
-        # 新增：如果存在约束违反，则记录日志
-        if invalid_reasons:
-            with open(self.invalid_log_file, 'a') as f:
-                log_entry = (
-                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                    f"Episode: {self.current_episode}, FL Round: {self.current_fl_round}\n"
-                )
-                log_entry += "  Reasons for invalid action:\n"
-                for reason in invalid_reasons:
-                    log_entry += f"    - {reason}\n"
-                f.write(log_entry + "\n")
-        
-
-
         # 3. 计算延迟和能耗
         delays, energies, costs = [], [], []
         device_energies_for_queue = np.zeros(self.N) # 新增：用于更新队列
@@ -716,8 +751,8 @@ class Env:
             agg_feedback_delay, agg_feedback_energy = 0.0, 0.0
 
             # 获取设备i的决策变量 (1或0)
-            is_local_train = 1 if i < len(train_local_decisions) and train_local_decisions[i] > 0.5 else 0
-            edge_train_selections = (edge_train_matrix[i] > 0.5).astype(int) if i < edge_train_matrix.shape[0] else np.zeros(self.M, dtype=int)
+            is_local_train = int(train_local_decisions[i]) if i < len(train_local_decisions) else 0
+            edge_train_selections = edge_train_matrix[i].astype(int) if i < edge_train_matrix.shape[0] else np.zeros(self.M, dtype=int)
             
             # --- 1. 累加训练成本 (遵循条件计算原则) ---
             # a. 如果选择本地训练(is_local_train=1)，累加其成本
@@ -738,16 +773,16 @@ class Env:
                     train_comm_energy += comm_e
                     device_energies_for_queue[i] += comm_e # 设备上传能耗计入设备
                     # 计算成本
-                    alloc = min(max(res_alloc_matrix[i, m], 0), 1)
-                    # 计算分配给该任务的CPU频率
-                    freq = self.f_e_min + alloc * (self.f_e_max - self.f_e_min)
+                    alloc_ratio = min(max(res_alloc_matrix[i, m], 0), 1)
+                    # 计算分配给该任务的CPU频率，alloc_ratio是总容量F_e的比例
+                    freq = alloc_ratio * self.F_e[m]
                     comp_d, comp_e = self._calculate_train_computation(i, edge_idx=m, is_local=False, freq=freq)
                     train_comp_delay += comp_d
                     train_comp_energy += comp_e # 边缘计算能耗只计入任务总成本
 
             # --- 2. 累加聚合成本 (遵循条件计算原则) ---
-            is_cloud_agg = 1 if cloud_agg_decision > 0.5 else 0
-            selected_agg_edges = np.where(edge_agg_decisions > 0.5)[0]
+            is_cloud_agg = int(cloud_agg_decision)
+            selected_agg_edges = np.where(edge_agg_decisions > 0)[0]
 
             # a. 累加所有被选中的边缘聚合方案的成本
             for agg_edge_idx in selected_agg_edges:
@@ -809,23 +844,57 @@ class Env:
         total_energy = sum(energies)
         total_cost = sum(costs)
         
-        # 计算每个设备的奖励（基于成本和队列的加权和）
+        # 计算每个设备的奖励（归一化和平衡后的版本）
+        # 权重参数
+        w_cost = 0.4
+        w_q = 0.5
+        w_loss = 0.1
+        
+        # 归一化和计算奖励
         for i in range(self.N):
-            if i < len(energies):  # 确保索引有效
+            if i < len(costs):
                 Q_i_t = self.queues[i].queue
-                device_reward = - (
-                    0.2 * Q_i_t * device_energies_for_queue[i]   # 队列项 (使用设备自身能耗)
-                  + 0.8 * costs[i]              # 成本项 (基于任务总能耗)
-                )
+                
+                # 1. 成本惩罚项 (归一化)
+                normalized_cost = costs[i] / self.max_cost_per_round
+                cost_penalty = w_cost * normalized_cost
+                
+                # 2. 队列惩罚项 (归一化)
+                q_energy = Q_i_t * device_energies_for_queue[i]
+                normalized_q_energy = q_energy / self.max_q_energy_per_round
+                q_penalty = w_q * normalized_q_energy
+
+                # 3. 性能奖励项 (更稳定的形式)
+                loss_reward = 0.0
+                if fl_loss is not None and 0 < fl_loss < 1:
+                    loss_reward = w_loss * (1.0 - fl_loss)
+
+                # 组合奖励
+                device_reward = loss_reward - cost_penalty - q_penalty
                 total_reward += device_reward
-                self.queues[i].update_queue(device_energies_for_queue[i]) # 更新队列使用设备自身能耗
+                self.queues[i].update_queue(device_energies_for_queue[i])
         
-        # 应用最终的约束惩罚
-        total_reward -= constraint_penalty
+        # ！！！核心逻辑修正：先更新内部状态，再生成下一个状态！！！
+        # 更新边缘节点的实际资源分配状态（仅用于状态表示）
+        self.f_e = np.full(self.M, 0.0)  # 重置为0
         
+        # 根据本轮实际决策更新边缘节点资源分配
+        for j in range(self.M):
+            total_alloc_freq = 0.0  # 累加分配的绝对频率
+            for i in range(self.N):
+                if i < edge_train_matrix.shape[0] and j < edge_train_matrix.shape[1] and edge_train_matrix[i, j] == 1:
+                    # 该设备的任务被分配到此边缘节点
+                    if i < res_alloc_matrix.shape[0] and j < res_alloc_matrix.shape[1]:
+                        alloc_ratio = min(max(res_alloc_matrix[i, j], 0), 1)
+                        # 计算分配的绝对频率并累加
+                        total_alloc_freq += alloc_ratio * self.F_e[j]
+            
+            # 确保不超过最大值
+            self.f_e[j] = min(total_alloc_freq, self.F_e[j])
+
         # 更新状态
         next_state = self._get_state()
-        self.current_fl_round += 1
+        self.current_fl_round += 1 # 内部的episode轮次计数器仍然需要
         
         # 判断Episode是否结束
         converged = False
@@ -857,24 +926,6 @@ class Env:
             "total_cost": total_cost,
             "valid_ratio": np.mean(valid_flags) if valid_flags else 0.0
         }
-        
-        # 更新边缘节点的实际资源分配状态（仅用于状态表示）
-        self.f_e = np.full(self.M, self.f_e_min)  # 重置为最小值
-        
-        # 根据本轮实际决策更新边缘节点资源分配
-        for j in range(self.M):
-            total_alloc = self.f_e_min  # 初始值为最小资源
-            for i in range(self.N):
-                if i < edge_train_matrix.shape[0] and j < edge_train_matrix.shape[1] and edge_train_matrix[i, j] == 1:
-                    # 该设备的任务被分配到此边缘节点
-                    if i < res_alloc_matrix.shape[0] and j < res_alloc_matrix.shape[1]:
-                        alloc_ratio = min(max(res_alloc_matrix[i, j], 0), 1)
-                        # 计算分配的资源并累加
-                        freq = self.f_e_min + alloc_ratio * (self.f_e_max - self.f_e_min)
-                        total_alloc += freq - self.f_e_min  # 累加分配的额外资源
-            
-            # 确保不超过最大值
-            self.f_e[j] = min(total_alloc, self.F_e[j])
         
         # 将信息保存到self.info中，确保其他方法可以访问
         self.info = info.copy()
@@ -995,7 +1046,20 @@ class Env:
         DEFAULT_F_E_MIN = 2.9e9  # 最小CPU频率 (2.9GHz)
         DEFAULT_F_E_MAX = 4.3e9  # 最大CPU频率 (4.3GHz)
         
-        # 解析动作
+        # 获取可用的终端设备和边缘节点（如果提供了clients_manager）
+        available_clients = []
+        available_edges = []
+        
+        if clients_manager:
+            available_clients = [
+                cid for cid in clients_manager.clients 
+                if clients_manager.clients[cid].available and cid.startswith("client")]
+            
+            available_edges = [
+                cid for cid in clients_manager.clients
+                if clients_manager.clients[cid].available and cid.startswith("edge")]
+        
+        # 解析动作 - parse_action应该返回 (决策向量, 连续矩阵)
         parsed_action = self._parse_action_for_training(action, clients_manager, server)
         
         # 提取解析结果
@@ -1007,13 +1071,41 @@ class Env:
         available_clients = parsed_action['available_clients']
         available_edges = parsed_action['available_edges']
     
+        #   # 动态创建边缘训练决策映射 - 修正索引逻辑
+        # edge_train_mapping = {}
+        # # 边缘决策向量对应的是全部N*M个选择，需要用绝对索引查找
+        # for client_id in available_clients:
+        #     try:
+        #         client_idx = int(client_id.split('_')[1])
+        #         if client_idx >= self.N:
+        #             continue
 
+        #         # 寻找该客户端得分最高的边缘节点
+        #         best_edge_id = None
+        #         max_score = -1
+        #         for edge_id in available_edges:
+        #             edge_idx = int(edge_id.split('_')[1])
+        #             if edge_idx >= self.M:
+        #                 continue
+                    
+        #             # 计算在扁平化的决策向量中的正确索引
+        #             action_vec_idx = client_idx * self.M + edge_idx
+        #             if action_vec_idx < len(edge_train_decisions):
+        #                 score = edge_train_decisions[action_vec_idx]
+        #                 if score > max_score:
+        #                     max_score = score
+        #                     best_edge_id = edge_id
+                
+        #         # 如果最高分大于0.5，则创建映射
+        #         if max_score > 0.5 and best_edge_id is not None:
+        #             edge_train_mapping[client_id] = best_edge_id
+        # --- 核心逻辑统一：确保决策解析与step()方法一致 ---
         
         # 1. 将决策向量转换为与step()方法中相同的二进制格式和矩阵格式
-        train_local_binary = (train_local_decisions > 0.5).astype(int)
+        train_local_binary = train_local_decisions.astype(int)
         
         edge_train_matrix = np.zeros((self.N, self.M), dtype=int)
-        edge_decisions_flat = (edge_train_decisions > 0.5).astype(int)
+        edge_decisions_flat = edge_train_decisions.astype(int)
         
         valid_indices = min(len(edge_decisions_flat), self.N * self.M)
         for idx in range(valid_indices):
@@ -1033,7 +1125,21 @@ class Env:
             if client_id not in available_clients:
                 continue
         
-     
+        # # 2. 处理训练决策
+        # drl_train_decisions = []  # 最终的训练决策列表 (1=本地训练，0=边缘训练)
+        # client_edge_mapping = {}  # 客户端到边缘节点的映射
+        # selected_edges_set = set()  # 选择的边缘节点集合
+        # selected_nodes = []  # 选择的节点列表
+        
+        # # 为每个可用的客户端分配训练决策
+        # for i, client_id in enumerate(available_clients):
+        #     if i >= self.N:  # 确保不超过设备数量限制
+        #         break
+            
+        #     # 决定该客户端是在本地训练还是边缘训练
+        #     if i < len(train_local_decisions) and train_local_decisions[i] > 0.5:
+        #         # 本地训练
+        #         drl_train_decisions.append(1)  # 1=本地训练
             is_local = i < len(train_local_binary) and train_local_binary[i] == 1
             edge_selections = edge_train_matrix[i]
             
@@ -1046,29 +1152,30 @@ class Env:
             elif np.sum(edge_selections) > 0:
                 # 选择第一个被标记的边缘节点进行训练
                 edge_idx = np.where(edge_selections == 1)[0][0]
-                edge_id = f"edge_{edge_idx}"
+                edge_id = f"edge_{edge_idx}" # ★★★ 最终修复：添加下划线以匹配 clients.py ★★★
                 if edge_id in available_edges:
                     selected_nodes.append(client_id)
                     drl_train_decisions.append(0) # 0=边缘训练
                     client_edge_mapping[client_id] = edge_id
                     selected_edges_set.add(edge_id)
         
-        # 3. 确定聚合位置 (逻辑保持不变)
-        if cloud_agg_decision > 0.5:
+        # 3. 确定聚合位置
+        if cloud_agg_decision > 0.5: # 修正为浮点数比较
             aggregation_location = "cloud"
         else:
             # DRL决策选择在边缘节点聚合
             # 选择得分最高的边缘节点
             selected_edge = None
-            max_score = -1
+            selected_idx = -1
             
             for j, edge_id in enumerate(available_edges):
-                if j < len(edge_agg_decisions) and edge_agg_decisions[j] > max_score:
-                    max_score = edge_agg_decisions[j]
+                if j < len(edge_agg_decisions) and edge_agg_decisions[j] == 1:
                     selected_edge = edge_id
+                    selected_idx = j
+                    break
             
-            # 如果有选中的边缘节点且其分数大于阈值，则在该边缘节点聚合
-            if selected_edge is not None and max_score > 0.5:
+            # 如果有选中的边缘节点，则在该边缘节点聚合
+            if selected_edge is not None:
                 aggregation_location = selected_edge
             else:
                 # 默认在云端聚合
@@ -1079,6 +1186,25 @@ class Env:
                           for j, edge_id in enumerate(available_edges)}
         
         # 4. 处理资源分配
+        # --- 新增：资源分配归一化 ---
+        res_alloc_matrix = res_alloc_flat.reshape((self.N, self.M))
+        
+        # 遍历每个边缘节点
+        for j in range(self.M):
+            # 找到分配给该边缘节点的客户端索引
+            assigned_client_indices = np.where(edge_train_matrix[:, j] == 1)[0]
+            
+            if len(assigned_client_indices) > 0:
+                # 计算这些客户端对该边缘节点的资源分配总和
+                allocation_sum = np.sum(res_alloc_matrix[assigned_client_indices, j])
+                
+                # 如果总和超过1.0，则按比例缩减
+                if allocation_sum > 1.0:
+                    res_alloc_matrix[assigned_client_indices, j] /= allocation_sum
+        
+        # 将修正后的矩阵重新展平
+        corrected_res_alloc_flat = res_alloc_matrix.flatten()
+
         client_resources = {}
         
         # 为终端设备分配资源（随机分配）
@@ -1094,7 +1220,10 @@ class Env:
             import random
             client_resources[client_id] = f_min + random.random() * (f_max - f_min)
         
-     
+        # 注意：边缘节点的资源分配和计算开销由环境的step方法统一处理
+        # get_fl_training_params只负责解析和传递决策，不进行重复计算
+        # 因此，这里不再为边缘节点计算和填充client_resources
+        
         # 5. 添加所有选定的边缘节点到训练节点列表
         selected_nodes.extend(selected_edges_set)
         
@@ -1127,11 +1256,12 @@ class Env:
         
         # 7. 构建原始决策字典
         raw_decisions = {
-            'local_train': (train_local_decisions > 0.5).astype(int),
-            'edge_train': (edge_train_decisions > 0.5).astype(int),
-            'edge_agg': (edge_agg_decisions > 0.5).astype(int),
-            'cloud_agg': (cloud_agg_decision > 0.5).astype(int),
-            'resource_alloc': res_alloc_flat # 资源分配保持原始浮点值
+            'local_train': train_local_decisions,
+            'edge_train': edge_train_decisions,
+            'edge_agg': edge_agg_decisions,
+            'cloud_agg': cloud_agg_decision,
+            'resource_alloc': corrected_res_alloc_flat, # 资源分配保持原始浮点值
+            'edge_client_mapping': client_edge_mapping # ★★★ 关键修复：添加映射 ★★★
         }
         
         return training_args, raw_decisions

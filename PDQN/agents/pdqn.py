@@ -26,9 +26,9 @@ class OrnsteinUhlenbeckActionNoise(object):
     Source: https://github.com/vy007vikas/PyTorch-ActorCriticRL/blob/master/utils.py
     """
 
-    def __init__(self, action_dim, mu=0, theta=0.15, sigma=0.2, random_machine=np.random):
+    def __init__(self, action_dim, mu=0.0, theta=0.15, sigma=0.2, random_machine=None):
         super(OrnsteinUhlenbeckActionNoise, self).__init__()
-        self.random = random_machine
+        self.random = random_machine if random_machine is not None else np.random
         self.action_dim = action_dim
         self.mu = mu
         self.theta = theta
@@ -113,7 +113,7 @@ class QActor(nn.Module):
 class ParamActor(nn.Module):
 
     def __init__(self, state_size, action_size, action_parameter_size, hidden_layers, squashing_function=False,
-                 output_layer_init_std=None, init_type="kaiming", activation="relu", init_std=None):
+                 output_layer_init_std=None, init_type="kaiming", activation="relu", init_std=0.01, num_actions_discrete=None):
         super(ParamActor, self).__init__()
 
         self.state_size = state_size
@@ -121,6 +121,10 @@ class ParamActor(nn.Module):
         self.action_parameter_size = action_parameter_size
         self.squashing_function = squashing_function
         self.activation = activation
+        if num_actions_discrete is None:
+            self.num_actions_discrete = self.action_size
+        else:
+            self.num_actions_discrete = num_actions_discrete
         if init_type == "normal":
             assert init_std is not None and init_std > 0
         assert self.squashing_function is False  # unsupported, cannot get scaling right yet
@@ -147,19 +151,24 @@ class ParamActor(nn.Module):
             else:
                 raise ValueError("Unknown init_type "+str(init_type))
             nn.init.zeros_(self.layers[i].bias)
+        
+        # 使用更大的初始化范围，以产生更多样化的初始输出
+        lim = 0.5  # 从0.1增加到0.5
         if output_layer_init_std is not None:
             nn.init.normal_(self.action_parameters_output_layer.weight, std=output_layer_init_std)
         else:
-            nn.init.zeros_(self.action_parameters_output_layer.weight)
-        nn.init.zeros_(self.action_parameters_output_layer.bias)
+            # 使用更大范围的均匀分布初始化
+            nn.init.uniform_(self.action_parameters_output_layer.weight, -lim, lim)
+
+        # 偏置也使用更大范围初始化
+        nn.init.uniform_(self.action_parameters_output_layer.bias, -lim, lim)
 
         nn.init.zeros_(self.action_parameters_passthrough_layer.weight)
         nn.init.zeros_(self.action_parameters_passthrough_layer.bias)
 
         # fix passthrough layer to avoid instability, rest of network can compensate
-        self.action_parameters_passthrough_layer.requires_grad = False
-        self.action_parameters_passthrough_layer.weight.requires_grad = False
-        self.action_parameters_passthrough_layer.bias.requires_grad = False
+        for param in self.action_parameters_passthrough_layer.parameters():
+            param.requires_grad_(False)
 
     def forward(self, state):
         # 确保输入为float32
@@ -177,7 +186,13 @@ class ParamActor(nn.Module):
                 raise ValueError("Unknown activation function "+str(self.activation))
         action_params = self.action_parameters_output_layer(x)
         action_params += self.action_parameters_passthrough_layer(state)
-
+        
+        # 对连续动作部分应用sigmoid激活函数
+        discrete_part = action_params[:, :self.num_actions_discrete]
+        continuous_part = action_params[:, self.num_actions_discrete:]
+        continuous_part = torch.sigmoid(continuous_part)  # 确保输出在(0,1)范围
+        action_params = torch.cat([discrete_part, continuous_part], dim=1)
+        
         return action_params
 
 
@@ -221,32 +236,59 @@ class PDQNAgent(Agent):
         super(PDQNAgent, self).__init__(observation_space, action_space)
         self.device = torch.device(device)
         
-        # 检查动作空间类型
-        if hasattr(action_space, 'spaces'):
-            # 原有代码处理复合动作空间
-            self.num_actions_discrete = action_space.spaces[0].nvec.shape[0]
-            self.action_parameter_sizes = np.array([(action_space.spaces[1].shape[0] * action_space.spaces[1].shape[1])])
-            self.num_actions_continuous_1 = self.action_parameter_sizes[0]  # 连续动作空间的数量
+        # 检查动作空间类型，并设置离散和连续动作的数量
+        if isinstance(action_space, spaces.Tuple) and len(action_space.spaces) == 2:
+            discrete_space, continuous_space = action_space.spaces
+            
+            # 新增: 处理由多个离散空间组成的元组
+            if isinstance(discrete_space, spaces.Tuple):
+                self.discrete_action_components = discrete_space.spaces
+                self.discrete_component_dims = []
+                num_discrete_actions = 0
+                for component in self.discrete_action_components:
+                    if isinstance(component, spaces.MultiDiscrete):
+                        # MultiDiscrete([2] * k) 代表 k 个独立的二元决策
+                        dim = component.nvec.shape[0]
+                        self.discrete_component_dims.append(dim)
+                        num_discrete_actions += dim
+                    elif isinstance(component, spaces.Discrete):
+                        # Discrete(n) 代表1个独立的n选一决策
+                        self.discrete_component_dims.append(1)
+                        num_discrete_actions += 1
+                    else:
+                        raise TypeError(f"不支持的离散动作空间组件: {type(component)}")
+                self.num_actions_discrete = num_discrete_actions
+            else:
+                raise TypeError("期望的动作空间离散部分是 gym.spaces.Tuple 类型")
+
+            if isinstance(continuous_space, spaces.Box):
+                # 连续动作参数的数量等于其形状的乘积
+                self.num_actions_continuous_1 = int(np.prod(continuous_space.shape))
+                self.action_parameter_sizes = np.array([self.num_actions_continuous_1])
+            else:
+                raise ValueError("连续动作空间必须是 gym.spaces.Box 类型")
         else:
-            # 处理Box类型动作空间 - 假设前44维是离散部分，后30维是连续部分
-            self.num_actions_discrete = 44
-            self.action_parameter_sizes = np.array([30])
-            self.num_actions_continuous_1 = 30  # 连续动作空间的数量
+            raise TypeError("期望的动作空间是 gym.spaces.Tuple([gym.spaces.Tuple, gym.spaces.Box])")
+
+        # 计算总动作参数大小 (离散部分 + 连续部分)
+        # QActor的输入需要这个总维度
+        self.action_parameter_size = self.num_actions_discrete + self.num_actions_continuous_1
         
-        # 计算总动作参数大小
-        self.action_parameter_size = self.num_actions_discrete + int(self.action_parameter_sizes.sum())
-        self.num_actions = self.num_actions_discrete + self.num_actions_continuous_1  # 离散的动作+连续的动作 总的数量
+        # QActor的输出维度是离散动作的数量，但P-DQN的原始论文假设是单个动作
+        # 为了兼容，我们将num_actions设为离散部分的总长度
+        # 注意：这要求QActor的输出层能处理一个表示并行决策的Q值向量
+        self.num_actions = self.num_actions_discrete
         
-        print("self.num_actions_discrete", self.num_actions_discrete)
-        print("self.num_actions_continuous_1", self.num_actions_continuous_1)
-        print("self.action_parameter_size", self.action_parameter_size)
-        print("self.num_actions", self.num_actions)
+        print("离散决策总数量 (num_actions_discrete):", self.num_actions_discrete)
+        print("离散决策组件维度 (discrete_component_dims):", self.discrete_component_dims)
+        print("连续参数数量 (num_actions_continuous_1):", self.num_actions_continuous_1)
+        print("总动作参数维度 (action_parameter_size):", self.action_parameter_size)
         
-        # 设置动作空间的最大最小值和范围
+        # 设置动作空间的最大最小值和范围 (离散为0/1, 连续为0-1)
         discrete_action_max = 1
         discrete_action_min = 0
-        continuous_action_max = 1  # 资源分配最大值
-        continuous_action_min = 0  # 资源分配最小值
+        continuous_action_max = 1
+        continuous_action_min = 0
         
         # 创建动作边界向量
         self.action_max = torch.from_numpy(np.concatenate([
@@ -272,13 +314,13 @@ class PDQNAgent(Agent):
             np.full(self.num_actions_continuous_1, continuous_action_min)
         ]).ravel()
         
-        self.action_parameter_range_numpy = (self.action_parameter_max_numpy - self.action_parameter_min_numpy)
+        self.action_parameter_range_numpy = self.action_parameter_max_numpy - self.action_parameter_min_numpy
         
         self.actions_count = 0
         
-        self.action_parameter_max = torch.from_numpy(self.action_parameter_max_numpy).float().to(device)
-        self.action_parameter_min = torch.from_numpy(self.action_parameter_min_numpy).float().to(device)
-        self.action_parameter_range = torch.from_numpy(self.action_parameter_range_numpy).float().to(device)
+        self.action_parameter_max = torch.from_numpy(self.action_parameter_max_numpy).float().to(self.device)
+        self.action_parameter_min = torch.from_numpy(self.action_parameter_min_numpy).float().to(self.device)
+        self.action_parameter_range = torch.from_numpy(self.action_parameter_range_numpy).float().to(self.device)
         
         self.epsilon = epsilon_initial
         self.epsilon_initial = epsilon_initial
@@ -290,9 +332,8 @@ class PDQNAgent(Agent):
         self.random_weighted = random_weighted
         assert (weighted ^ average ^ random_weighted) or not (weighted or average or random_weighted)
 
-        # 设置动作参数偏移
-        self.action_parameter_offsets = self.action_parameter_sizes.cumsum()
-        self.action_parameter_offsets = np.insert(self.action_parameter_offsets, 0, 0)
+        # 动作参数偏移量 (现在包含离散和连续部分)
+        self.action_parameter_offsets = np.array([0, self.num_actions_discrete, self.action_parameter_size])
 
         self.batch_size = batch_size
         self.gamma = gamma
@@ -310,25 +351,22 @@ class PDQNAgent(Agent):
         self.clip_grad = clip_grad
         self.zero_index_gradients = zero_index_gradients
 
-
-
-        self.np_random = None
+        self.np_random = np.random.RandomState()
         self.seed = seed
         self._seed(seed)
 
         self.use_ornstein_noise = use_ornstein_noise
-        # 噪声应该加到连续的动作空间向量上去
-        self.noise = OrnsteinUhlenbeckActionNoise(self.action_parameter_size, random_machine=self.np_random, mu=0., theta=0.15, sigma=0.0001) #, theta=0.01, sigma=0.01)
-
-        print("self.num_actions+self.action_parameter_size",self.num_actions+self.action_parameter_size)
+        # 噪声应该加到总的动作参数向量上去
+        self.noise = OrnsteinUhlenbeckActionNoise(self.action_parameter_size, mu=0.0, theta=0.15, sigma=0.2, random_machine=self.np_random)
 
         print("self.observation_space.shape[0]",self.observation_space.shape[0])
 
-        self.replay_memory = Memory(replay_memory_size, observation_space.shape, (self.action_parameter_size,), next_actions=False)
-        # self.replay_memory = Memory(replay_memory_size, observation_space.shape, (1+self.action_parameter_size,), next_actions=False)
+        # 经验回放缓冲区存储总的动作参数向量
+        # 确保状态维度与环境提供的维度匹配
+        self.replay_memory = Memory(replay_memory_size, self.observation_space.shape, (self.action_parameter_size,), next_actions=False)
         
-        self.actor = actor_class(self.observation_space.shape[0], self.num_actions, self.action_parameter_size, **actor_kwargs).to(device)
-        self.actor_target = actor_class(self.observation_space.shape[0], self.num_actions, self.action_parameter_size, **actor_kwargs).to(device)
+        self.actor = actor_class(self.observation_space.shape[0], self.num_actions_discrete * 2, self.action_parameter_size, **actor_kwargs).to(device)
+        self.actor_target = actor_class(self.observation_space.shape[0], self.num_actions_discrete * 2, self.action_parameter_size, **actor_kwargs).to(device)
         hard_update_target_network(self.actor, self.actor_target)
         self.actor_target.eval()
 
@@ -341,17 +379,19 @@ class PDQNAgent(Agent):
         # 添加 hidden_layers 作为位置参数
         self.actor_param = actor_param_class(
             self.observation_space.shape[0], 
-            self.num_actions, 
+            self.num_actions_discrete, 
             self.action_parameter_size, 
             hidden_layers,  # 添加 hidden_layers 参数
+            num_actions_discrete=self.num_actions_discrete,
             **actor_param_kwargs
         ).to(device)
 
         self.actor_param_target = actor_param_class(
             self.observation_space.shape[0], 
-            self.num_actions, 
+            self.num_actions_discrete, 
             self.action_parameter_size, 
             hidden_layers,  # 添加 hidden_layers 参数
+            num_actions_discrete=self.num_actions_discrete,
             **actor_param_kwargs
         ).to(device)
         hard_update_target_network(self.actor_param, self.actor_param_target)
@@ -399,9 +439,10 @@ class PDQNAgent(Agent):
             print(passthrough_layer.bias.data.size())
             assert initial_bias.shape == passthrough_layer.bias.data.size()
             passthrough_layer.bias.data = torch.Tensor(initial_bias).float().to(self.device)
-        passthrough_layer.requires_grad = False
-        passthrough_layer.weight.requires_grad = False
-        passthrough_layer.bias.requires_grad = False
+        
+        # 修复requires_grad设置
+        for param in passthrough_layer.parameters():
+            param.requires_grad_(False)
 
         hard_update_target_network(self.actor_param, self.actor_param_target)
 
@@ -415,7 +456,13 @@ class PDQNAgent(Agent):
         self.seed = seed
         random.seed(seed)
         np.random.seed(seed)
-        self.np_random = np.random.RandomState(seed=seed)
+        
+        # 确保np_random被正确初始化
+        if seed is not None:
+            self.np_random = np.random.RandomState(seed=seed)
+        else:
+            self.np_random = np.random.RandomState()
+            
         if seed is not None:
             torch.manual_seed(seed)
             if self.device == torch.device("cuda"):
@@ -439,48 +486,125 @@ class PDQNAgent(Agent):
             self.epsilon = self.epsilon_final
 
     def select_action(self, state):
+        """
+        根据当前状态选择一个(离散动作, 连续参数)。
+        离散动作对应环境的多决策输出，连续参数是所有离散动作共享的一维向量。
+        """
         with torch.no_grad():
-            state = torch.from_numpy(state).to(self.device)
-            all_action_parameters = self.actor_param.forward(state)
+            # 1. state 加 batch 维
+            state_tensor = torch.tensor(state, dtype=torch.float32) \
+                               .unsqueeze(0).to(self.device)          # shape (1, state_dim)
 
-            # 动态衰减的ε-贪婪策略
-            epsilon_end = 0.01
-            epsilon_start = 1 
-            epsilon_decay = 3000
-            
-            self.epsilon = epsilon_end + (epsilon_start - epsilon_end) * \
-                          math.exp(-1. * self.actions_count / epsilon_decay)
-            self.actions_count += 1
+            # 2. 预测完整的动作参数（包含离散和连续）和Q值
+            all_action_parameters = self.actor_param(state_tensor)      # shape (1, param_dim)
+            q_values = self.actor(state_tensor, all_action_parameters)  # shape (1, num_disc_actions)
+            q_values = q_values[0]                                      # shape (num_disc_actions,)
 
-            # 以epsilon的概率随机探索
-            rnd = self.np_random.uniform()
-            if rnd < self.epsilon:
-                # 随机探索生成的动作参数，范围在[min, max]之间
-                all_action_parameters = torch.from_numpy(np.random.uniform(
-                    self.action_parameter_min_numpy[:self.action_parameter_size],
-                    self.action_parameter_max_numpy[:self.action_parameter_size]))
+            # 4. ε-greedy 策略
+            if self.np_random.uniform() < self.epsilon:
+                # --- 探索 (EXPLORATION) ---
+                # a. 生成一个绝对有效的随机离散动作
+                discrete_action_tuple = self._sample_valid_action()
+                discrete_action_flat = np.concatenate([np.atleast_1d(a) for a in discrete_action_tuple])
+                
+                # b. 为连续参数生成随机值
+                continuous_params = self.np_random.uniform(
+                    self.action_parameter_min_numpy[self.num_actions_discrete:],
+                    self.action_parameter_max_numpy[self.num_actions_discrete:]
+                )
             else:
-                # 根据策略选择动作
-                Q_a = self.actor.forward(state.unsqueeze(0), all_action_parameters.unsqueeze(0))
-                Q_a = Q_a.detach().cpu().data.numpy()
+                # --- 利用 (EXPLOITATION) ---
+                # a. 从网络输出中提取连续参数部分
+                all_params_from_net = all_action_parameters[0].cpu().numpy()
+                continuous_params = all_params_from_net[self.num_actions_discrete:]
+                
+                # b. 简化的动作生成：新动作空间天然满足约束，不需要复杂矫正
+                num_devices = self.discrete_component_dims[0]  # N
+                num_edges = 2  # 暂时硬编码，应该从环境获取
+                
+                # 根据Q值生成新动作空间格式的动作
+                # 1. 本地训练决策：N维，每个设备0/1
+                train_local = np.zeros(num_devices, dtype=int)
+                for i in range(min(num_devices, len(q_values)//2)):
+                    if i*2+1 < len(q_values):
+                        train_local[i] = 1 if q_values[i*2+1] > q_values[i*2] else 0
+                
+                # 2. 边缘选择决策：N维，每个设备选择0到M-1
+                edge_selection = np.random.randint(0, num_edges, size=num_devices)
+                
+                # 3. 聚合决策：选择0到M (M为云)
+                aggregation_choice = np.random.randint(0, num_edges + 1)
+                
+                # 组装新动作空间格式的离散动作
+                discrete_action_flat = np.concatenate([train_local, edge_selection, np.array([aggregation_choice])])
 
-            # 转换为numpy数组并返回扁平数组
-            all_action_parameters = all_action_parameters.cpu().data.numpy()
-            
-            # 确保参数在正确范围内
-            all_action_parameters = np.clip(all_action_parameters, 
-                                          self.action_parameter_min_numpy[:len(all_action_parameters)],
-                                          self.action_parameter_max_numpy[:len(all_action_parameters)])
-            
-            return all_action_parameters  # 返回扁平数组
+            # 5. 只对连续参数部分应用噪声
+            if self.use_ornstein_noise and self.noise is not None:
+                full_noise_sample = self.noise.sample()
+                continuous_noise = full_noise_sample[self.num_actions_discrete:]
+                continuous_params += continuous_noise
 
-    def random_action(self,state):
-        all_action_parameters = torch.from_numpy(np.random.uniform(
-            self.action_parameter_min_numpy[:self.action_parameter_size],
-            self.action_parameter_max_numpy[:self.action_parameter_size]))
-        all_action_parameters = all_action_parameters.cpu().data.numpy()
+            # 6. 只对连续参数部分进行裁剪
+            continuous_params = np.clip(continuous_params,
+                                        self.action_parameter_min_numpy[self.num_actions_discrete:],
+                                        self.action_parameter_max_numpy[self.num_actions_discrete:])
+
+            # 7. 从有效的离散部分(discrete_action_flat)构建最终的离散动作元组
+            actions_list, pos = [], 0
+            for dim in self.discrete_component_dims:
+                if dim == 1:
+                    actions_list.append(int(discrete_action_flat[pos]))
+                else:
+                    # 确保是整数类型
+                    actions_list.append(discrete_action_flat[pos:pos+dim].astype(int))
+                pos += dim
+            discrete_action = tuple(actions_list)
+            
+            # 8. 最终的连续参数就是处理过的continuous_params
+            continuous_params_only = continuous_params
+
+        # 返回 (有效的离散动作元组, 处理后的连续参数ndarray)
+        return discrete_action, continuous_params_only
+
+    def _sample_valid_action(self):
+        """
+        生成一个随机但有效的离散动作，适配新的动作空间格式。
+        新动作空间: (本地训练N维0/1, 边缘选择N维0到M-1, 聚合选择1维0到M)
+        """
+        # 从 self.discrete_component_dims 获取维度信息
+        # 新格式应该是 [N, N, 1] 对应 [本地训练, 边缘选择, 聚合选择]
+        num_devices = self.discrete_component_dims[0]  # N
+        # 从环境动作空间推断边缘节点数量
+        if hasattr(self, '_num_edges'):
+            num_edges = self._num_edges
+        else:
+            # 尝试从动作空间推断
+            num_edges = 2  # 默认值，应该从环境获取
+
+        # 1. 本地训练决策：每个设备0或1
+        train_local = np.random.randint(0, 2, size=num_devices)
         
-        return all_action_parameters
+        # 2. 边缘训练决策：每个设备选择0到M-1的边缘节点
+        edge_selection = np.random.randint(0, num_edges, size=num_devices)
+        
+        # 3. 聚合决策：选择0到M (M为云)
+        aggregation_choice = np.random.randint(0, num_edges + 1)
+
+        # 4. 组装成新的元组格式
+        # (本地训练决策, 边缘选择决策, 聚合决策)
+        return (train_local, edge_selection, aggregation_choice)
+
+    def random_action(self, state):
+        # 使用新的智能探索来生成有效的随机动作
+        discrete_action = self._sample_valid_action()
+
+        # 连续参数部分依然可以完全随机
+        continuous_params = np.random.uniform(
+            self.action_parameter_min_numpy[self.num_actions_discrete:],
+            self.action_parameter_max_numpy[self.num_actions_discrete:]
+        )
+        
+        return discrete_action, continuous_params
 
     def _zero_index_gradients(self, grad, batch_action_indices, inplace=True):
         assert grad.shape[0] == batch_action_indices.shape[0]
@@ -530,24 +654,88 @@ class PDQNAgent(Agent):
         return grad
 
     def store(self, state, action, reward, next_state, terminals):
-        all_action_parameters = action
+        # 处理元组格式的动作输入
+        if isinstance(action, tuple) and len(action) == 2:
+            discrete_action, continuous_params = action
+        else:
+            raise TypeError("Action must be a tuple: (discrete_action, continuous_parameters)")
+            
         self._step += 1
 
-        # self._add_sample(state, np.concatenate((all_actions.data, all_action_parameters.data)).ravel(), reward, next_state, terminal)
+        # 将元组形式的离散动作扁平化，以便存储
+        discrete_action_parts = []
+        for part in discrete_action:
+            discrete_action_parts.append(np.atleast_1d(part).flatten())
+        discrete_action_flat = np.concatenate(discrete_action_parts)
+        
+        continuous_params_flat = continuous_params.flatten() if hasattr(continuous_params, 'flatten') else np.array(continuous_params).flatten()
+        
+        # 确保维度匹配 - 截断或填充以匹配self.action_parameter_size
+        if len(discrete_action_flat) + len(continuous_params_flat) != self.action_parameter_size:
+            # 调整discrete_action_flat的大小
+            if len(discrete_action_flat) > self.num_actions_discrete:
+                discrete_action_flat = discrete_action_flat[:self.num_actions_discrete]
+            elif len(discrete_action_flat) < self.num_actions_discrete:
+                # 填充到正确大小
+                padding = np.zeros(self.num_actions_discrete - len(discrete_action_flat))
+                discrete_action_flat = np.concatenate([discrete_action_flat, padding])
+                
+            # 调整continuous_params_flat的大小
+            continuous_size = self.action_parameter_size - self.num_actions_discrete
+            if len(continuous_params_flat) > continuous_size:
+                continuous_params_flat = continuous_params_flat[:continuous_size]
+            elif len(continuous_params_flat) < continuous_size:
+                # 填充到正确大小
+                padding = np.zeros(continuous_size - len(continuous_params_flat))
+                continuous_params_flat = np.concatenate([continuous_params_flat, padding])
+                
+        # 拼接成一个向量
+        all_action_parameters = np.concatenate([discrete_action_flat, continuous_params_flat])
+        
+        # 处理状态维度不匹配问题
+        # 检查状态维度是否与Memory期望的维度匹配
+        expected_state_shape = self.replay_memory.states.data.shape[1:]
+        if isinstance(state, np.ndarray) and state.shape != expected_state_shape:
+            print(f"警告: 状态维度不匹配 - 输入: {state.shape}, 期望: {expected_state_shape}")
+            # 调整状态维度
+            if len(state) > expected_state_shape[0]:
+                # 截断多余的维度
+                state = state[:expected_state_shape[0]]
+            elif len(state) < expected_state_shape[0]:
+                # 填充缺失的维度
+                padding = np.zeros(expected_state_shape[0] - len(state))
+                state = np.concatenate([state, padding])
+        
+        # 对next_state也做同样的处理
+        if isinstance(next_state, np.ndarray) and next_state.shape != expected_state_shape:
+            print(f"警告: 下一状态维度不匹配 - 输入: {next_state.shape}, 期望: {expected_state_shape}")
+            # 调整状态维度
+            if len(next_state) > expected_state_shape[0]:
+                next_state = next_state[:expected_state_shape[0]]
+            elif len(next_state) < expected_state_shape[0]:
+                padding = np.zeros(expected_state_shape[0] - len(next_state))
+                next_state = np.concatenate([next_state, padding])
+
+        # 存储样本
         self._add_sample(state, all_action_parameters, reward, next_state, terminals)
         if self._step >= self.batch_size and self._step >= self.initial_memory_threshold:
             self._optimize_td_loss()
             self.updates += 1
 
     def _add_sample(self, state, action, reward, next_state, terminals):
-        # 直接存储完整的动作向量
+        # 存储到经验回放缓冲区
         self.replay_memory.append(state, action, reward, next_state, terminals)
 
     def _optimize_td_loss(self):
-        if self._step < self.batch_size or self._step < self.initial_memory_threshold:
+        if self._step < self.batch_size or self.initial_memory_threshold > self._step:
             return
         # Sample a batch from replay memory
-        states, actions_combined, rewards, next_states, terminals = self.replay_memory.sample(self.batch_size, random_machine=self.np_random)
+        sample_batch = self.replay_memory.sample(self.batch_size)
+        
+        if len(sample_batch) == 6:
+            states, actions_combined, rewards, next_states, _, terminals = sample_batch
+        else:
+            states, actions_combined, rewards, next_states, terminals = sample_batch
 
         states = torch.from_numpy(states).to(self.device)
         actions_combined = torch.from_numpy(actions_combined).to(self.device)
@@ -556,37 +744,61 @@ class PDQNAgent(Agent):
         terminals = torch.from_numpy(terminals).to(self.device).squeeze()
 
         # 将动作参数分为离散部分和连续部分
-        # 前 self.num_actions_discrete 个参数是离散动作
-        # 后续参数是连续动作参数
         discrete_actions = actions_combined[:, :self.num_actions_discrete]
         continuous_parameters = actions_combined[:, self.num_actions_discrete:]
         
-        # 对于Q值评估，我们使用离散动作索引
-        # 找到每个样本中最大值对应的索引作为动作
-        values, indices = torch.max(discrete_actions, dim=1)
-        actions = indices.long()
+        # 离散动作现在是一个多维向量，我们需要找到每个决策的索引 (0或1)
+        # 对于二元决策，这等同于将向量本身作为动作
+        actions = discrete_actions.long()
         
         # ---------------------- optimize Q-network ----------------------
         with torch.no_grad():
-            # 获取下一状态的动作参数
-            pred_next_action_parameters = self.actor_param_target.forward(next_states)
+            # 获取下一状态的动作参数 (离散+连续)
+            pred_next_all_action_parameters = self.actor_param_target.forward(next_states)
+            
             # 使用目标网络评估下一状态的Q值
-            pred_Q_a = self.actor_target(next_states, pred_next_action_parameters)
-            # 选择最大Q值
-            Qprime = torch.max(pred_Q_a, 1, keepdim=True)[0].squeeze()
+            # 注意：QActor的输出现在是一个向量，每个元素对应一个离散决策的Q值
+            pred_Q_a = self.actor_target(next_states, pred_next_all_action_parameters)
+            
+            # 选择每个决策维度上的最大Q值
+            # pred_Q_a 的形状是 (batch, num_actions_discrete * 2)
+            q_values_reshaped = pred_Q_a.view(-1, self.num_actions_discrete, 2)
+            Qprime_per_dim, _ = torch.max(q_values_reshaped, dim=2)
+            Qprime = Qprime_per_dim.sum(dim=1) # 对所有决策的Q值求和
 
             # 计算TD目标
             target = rewards + (1 - terminals) * self.gamma * Qprime
 
         # 计算当前策略的Q值
-        q_values = self.actor(states, actions_combined)
-        y_predicted = q_values.gather(1, actions.view(-1, 1)).squeeze()
+        # QActor的输出需要调整以匹配多维离散动作
+        q_values_per_dim = self.actor(states, actions_combined)
+        
+        # 从输出中收集与所采取的动作对应的Q值
+        # q_values_per_dim 的形状是 (batch, num_actions_discrete * 2)
+        # 我们需要将其重塑并收集
+        q_values_reshaped = q_values_per_dim.view(-1, self.num_actions_discrete, 2)
+        y_predicted = q_values_reshaped.gather(2, actions.unsqueeze(2)).squeeze(2).sum(dim=1)
+
         y_expected = target
         loss_Q = self.loss_func(y_predicted, y_expected)
 
         # 优化Q网络
         self.actor_optimiser.zero_grad()
         loss_Q.backward()
+
+        # --- 调试代码：检查损失和梯度 ---
+        if torch.isnan(loss_Q) or torch.isinf(loss_Q):
+            print("!!! FATAL: Loss is NaN or Inf !!!")
+            print(f"Loss value: {loss_Q.item()}")
+
+        for name, param in self.actor.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    print(f"!!! FATAL: Gradient for {name} is NaN or Inf !!!")
+                    print(param.grad)
+        # --- 调试代码结束 ---
+
+        # Clip gradients
         if self.clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.clip_grad)
         self.actor_optimiser.step()
@@ -598,29 +810,18 @@ class PDQNAgent(Agent):
         
         # 计算策略网络输出的Q值
         Q = self.actor(states, action_params)
-        Q_val = Q
         
-        # 根据设置应用加权策略
-        if self.weighted:
-            # 使用动作计数统计作为权重
-            counts = Counter(actions.cpu().numpy())
-            weights = torch.from_numpy(
-                np.array([counts[a] / actions.shape[0] for a in range(self.num_actions)])).float().to(self.device)
-            Q_val = weights * Q
-        elif self.average:
-            Q_val = Q / self.num_actions
-        elif self.random_weighted:
-            weights = np.random.uniform(0, 1., self.num_actions)
-            weights /= np.linalg.norm(weights)
-            weights = torch.from_numpy(weights).float().to(self.device)
-            Q_val = weights * Q
+        # 对于多维决策，总Q值是每个决策维度的最大Q值之和
+        q_values_reshaped = Q.view(-1, self.num_actions_discrete, 2)
+        q_max_per_dim, _ = torch.max(q_values_reshaped, dim=2)
+        Q_val = q_max_per_dim.sum(dim=1)
+        
+        # 根据设置应用加权策略 (这里可能需要重新思考加权逻辑)
+        if self.weighted or self.average or self.random_weighted:
+            print("警告: 加权方案在MultiDiscrete动作空间下可能无法按预期工作。")
             
         # 计算策略网络的损失
-        if self.indexed:
-            Q_indexed = Q_val.gather(1, actions.unsqueeze(1))
-            Q_loss = torch.mean(Q_indexed)
-        else:
-            Q_loss = torch.mean(torch.sum(Q_val, 1))
+        Q_loss = -torch.mean(Q_val) # 我们希望最大化Q值，所以最小化其负值
             
         # 更新策略网络
         self.actor.zero_grad()
@@ -634,7 +835,8 @@ class PDQNAgent(Agent):
         # 应用梯度反转和零梯度索引
         delta_a[:] = self._invert_gradients(delta_a, action_params, grad_type="action_parameters", inplace=True)
         if self.zero_index_gradients:
-            delta_a[:] = self._zero_index_gradients(batch_action_indices=actions, inplace=True)
+             # 对于MultiDiscrete，这个逻辑需要重写
+             raise NotImplementedError("Zero index gradients not supported with MultiDiscrete action space.")
 
         out = -torch.mul(delta_a, action_params)
         self.actor_param.zero_grad()
@@ -673,15 +875,38 @@ class PDQNAgent(Agent):
         执行贪心动作，始终选择最大Q值的动作
         """
         with torch.no_grad():
-            state = torch.from_numpy(state).to(self.device)
-            all_action_parameters = self.actor_param.forward(state)
+            state_tensor = torch.from_numpy(state).to(self.device)
+            all_action_parameters = self.actor_param.forward(state_tensor)
             
             # 使用actor选择最优动作
-            Q_a = self.actor.forward(state.unsqueeze(0), all_action_parameters.unsqueeze(0))
-            Q_a = Q_a.detach().cpu().data.numpy()
+            q_values = self.actor.forward(state_tensor.unsqueeze(0), all_action_parameters.unsqueeze(0))
             
-            # 不使用epsilon探索，直接选择最大Q值的动作
+            # 将扁平化的Q值重塑为 (决策数量, 每个决策的选项数=2)
+            q_values_reshaped = q_values.view(self.num_actions_discrete, 2)
+            
+            # 为每个独立决策选择最优动作
+            discrete_action_flat = torch.argmax(q_values_reshaped, dim=1).cpu().numpy()
+
+            # 将扁平化的动作向量转换回元组结构
+            actions_list = []
+            current_pos = 0
+            for dim in self.discrete_component_dims:
+                if dim == 1:
+                    actions_list.append(discrete_action_flat[current_pos])
+                else:
+                    actions_list.append(discrete_action_flat[current_pos : current_pos + dim])
+                current_pos += dim
+            discrete_action = tuple(actions_list)
+            
+            # 转换连续参数为numpy数组
             all_action_parameters = all_action_parameters.cpu().data.numpy()
             
-        return all_action_parameters
+            # 确保参数在正确范围内
+            all_action_parameters = np.clip(all_action_parameters, 
+                                    self.action_parameter_min_numpy[:len(all_action_parameters)],
+                                    self.action_parameter_max_numpy[:len(all_action_parameters)])
+            
+            continuous_params_only = all_action_parameters[self.num_actions_discrete:]
+
+            return discrete_action, continuous_params_only
 
