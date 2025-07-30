@@ -12,9 +12,8 @@ from torch.utils.data import DataLoader
 from models.models import create_model
 import torch.nn as nn
 
-# 模型收敛阈值
-CONVERGENCE_EPSILON = 1e-4
-CONVERGENCE_PATIENCE = 3 # 连续多少轮无明显变化则认为收敛
+# 导入配置参数
+from config import *
 
 class FederatedServer:
     """联邦学习服务器 - 处理模型聚合与评估"""

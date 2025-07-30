@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# 导入配置参数
 from config import *
 from utils.common_utils import set_seed, calculate_distance
 
@@ -112,9 +113,9 @@ class Client(ClientBase):
         if dataset is None or len(dataset) == 0:
             return None, None, None
         idxs = list(range(len(dataset)))
-        idxs_train = idxs[:int(0.8*len(idxs))]
-        idxs_val = idxs[int(0.8*len(idxs)):int(0.9*len(idxs))]
-        idxs_test = idxs[int(0.9*len(idxs)):]
+        idxs_train = idxs[:int(TRAIN_RATIO*len(idxs))]
+        idxs_val = idxs[int(TRAIN_RATIO*len(idxs)):int((TRAIN_RATIO+VAL_RATIO)*len(idxs))]
+        idxs_test = idxs[int((TRAIN_RATIO+VAL_RATIO)*len(idxs)):]
         trainloader = DataLoader(DatasetSplit(dataset, idxs_train), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
         val_bs = max(1, int(len(idxs_val)/10)) if len(idxs_val) > 0 else 1
         validloader = DataLoader(DatasetSplit(dataset, idxs_val), batch_size=val_bs, shuffle=False, num_workers=0)
@@ -130,7 +131,7 @@ class Client(ClientBase):
         return params, grads, loss, train_time, self.local_data_size
 
 class EdgeNode(ClientBase):
-    def __init__(self, device, edge_id=None, coverage_radius=500.0):
+    def __init__(self, device, edge_id=None, coverage_radius=EDGE_COVERAGE_RADIUS):
         super().__init__(None, device, edge_id, is_edge=True)
         self.coverage_radius = coverage_radius
         self.connected_clients = {}
@@ -154,7 +155,8 @@ class EdgeNode(ClientBase):
         return params, grads, loss, train_time, client_on_behalf_of.local_data_size
 
 class ClientsGroup:
-    def __init__(self, dataset_name, is_iid, num_clients, device, num_edges=2, non_iid_level=0.5):
+    def __init__(self, dataset_name=DEFAULT_DATASET, is_iid=IID, num_clients=NUM_CLIENTS, 
+                 device=DEVICE, num_edges=NUM_EDGES, non_iid_level=NON_IID_LEVEL):
         set_seed(SEED)
         self.dataset_name = dataset_name
         self.is_iid = is_iid
@@ -237,17 +239,17 @@ class ClientsGroup:
         for i in range(env.N):
             client_id = f"client{i}"
             if client_id in self.clients:
-                if i < len(env.queues):
-                    remaining_energy = env.energy_max - env.queues[i].queue
+                if i < len(env.queue_manager.queues):
+                    remaining_energy = env.energy_max - env.queue_manager.queues[i].queue
                     self.clients[client_id].update_state(
-                        compute_capability=env.f_l[i],
+                        compute_capability=env.comp_model.f_l[i],
                         energy_level=remaining_energy,
                         available=remaining_energy > 0
                     )
         for i in range(env.M):
             edge_id = f"edge_{i}"
             if edge_id in self.edge_nodes:
-                self.edge_nodes[edge_id].update_state(compute_capability=env.F_e[i])
+                self.edge_nodes[edge_id].update_state(compute_capability=env.comp_model.F_e[i])
 
     def get_data_sizes(self):
         data_sizes = []

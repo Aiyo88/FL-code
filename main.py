@@ -15,53 +15,58 @@ from clients import ClientsGroup
 from server import FederatedServer
 from drl_adapters import create_drl_agent
 from plot.plot_award import log_training_result, plot_training_results, plot_all_logs, log_episode_result
-# 导入config模块
-from config import MIN_ENERGY
+from models.action_parser import ActionParser
+# 导入配置参数
+from config import *
 
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description="联邦学习训练")
     
     # 系统参数
-    parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser.add_argument('--seed', type=int, default=SEED, help='随机种子')
     parser.add_argument('--device', type=str, default='cuda', help='使用设备 (cpu/cuda)')
-    parser.add_argument('--save_path', type=str, default='./checkpoints', help='模型保存路径')
-    parser.add_argument('--data_path', type=str, default='./data', help='数据集路径')
-    parser.add_argument('--disable_progress_bar', type=int, default=0, help='禁用进度条 (0/1)')
+    parser.add_argument('--save_path', type=str, default=CHECKPOINT_PATH, help='模型保存路径')
+    parser.add_argument('--data_path', type=str, default=DATA_PATH, help='数据集路径')
+    parser.add_argument('--disable_progress_bar', type=int, default=int(DISABLE_PROGRESS_BAR), help='禁用进度条 (0/1)')
     
     # 联邦学习参数
-    parser.add_argument('--dataset', type=str, default='mnist', help='数据集 (mnist/cifar10)')
-    parser.add_argument('--model', type=str, default='mnist', help='模型类型 (cnn)')
-    parser.add_argument('--num_clients', type=int, default=5, help='客户端数量')
-    parser.add_argument('--num_edges', type=int, default=2, help='边缘节点数量')
-    parser.add_argument('--iid', type=int, default=1, help='是否为IID数据分布 (0/1)')
-    parser.add_argument('--non_iid_level', type=int, default=1, help='非IID数据分布级别 (1/2/3)')
-    parser.add_argument('--epochs', type=int, default=5, help='本地训练轮数')
-    parser.add_argument('--batch_size', type=int, default=1024, help='本地批次大小')  # 大批次充分利用GPU
-    parser.add_argument('--lr', type=float, default=0.001, help='联邦学习学习率')
-    parser.add_argument('--num_rounds', type=int, default=100, help='每个DRL Episode内联邦学习轮次的总数上限')
-    parser.add_argument('--num_episodes', type=int, default=200, help='DRL训练的Episode总数上限')
+    parser.add_argument('--dataset', type=str, default=DEFAULT_DATASET, help='数据集 (mnist/cifar10)')
+    parser.add_argument('--model', type=str, default=DEFAULT_MODEL, help='模型类型 (cnn)')
+    parser.add_argument('--num_clients', type=int, default=NUM_CLIENTS, help='客户端数量')
+    parser.add_argument('--num_edges', type=int, default=NUM_EDGES, help='边缘节点数量')
+    parser.add_argument('--iid', type=int, default=int(IID), help='是否为IID数据分布 (0/1)')
+    parser.add_argument('--non_iid_level', type=int, default=NON_IID_LEVEL, help='非IID数据分布级别 (1/2/3)')
+    parser.add_argument('--epochs', type=int, default=LOCAL_EPOCHS, help='本地训练轮数')
+    parser.add_argument('--batch_size', type=int, default=BATCH_SIZE, help='本地批次大小')
+    parser.add_argument('--lr', type=float, default=LEARNING_RATE, help='联邦学习学习率')
+    parser.add_argument('--num_rounds', type=int, default=NUM_ROUNDS, help='每个DRL Episode内联邦学习轮次的总数上限')
+    parser.add_argument('--num_episodes', type=int, default=NUM_EPISODES, help='DRL训练的Episode总数上限')
     
-    parser.add_argument('--drl_train', type=int, default=1, help='是否训练DRL智能体 (0/1)')
-    parser.add_argument('--drl_algo', type=str, default='pdqn', help='DRL算法 (a3c/pdqn/ddpg/ppo/sac/td3)')
+    parser.add_argument('--drl_train', type=int, default=int(DRL_TRAIN), help='是否训练DRL智能体 (0/1)')
+    parser.add_argument('--drl_algo', type=str, default=DRL_ALGO, help='DRL算法 (a3c/pdqn/ddpg/ppo/sac/td3)')
     parser.add_argument('--drl_load', type=str, default=None, help='加载DRL模型路径')
     
     # DRL 智能体超参数
-    parser.add_argument('--drl_lr', type=float, default=0.0003, help='DRL Actor网络学习率 (LR)')  # 提高学习率
-    parser.add_argument('--drl_batch_size', type=int, default=512, help='DRL 批次大小 (BATCH_SIZE)')  # 大批次利用GPU
-    parser.add_argument('--drl_gamma', type=float, default=0.99, help='DRL 折扣因子 (GAMMA)')  # 更关注长期奖励
-    parser.add_argument('--drl_memory_size', type=int, default=20000, help='DRL 回放缓存区大小 (MEMORY)')
+    parser.add_argument('--drl_lr', type=float, default=DRL_LR, help='DRL Actor网络学习率 (LR)')
+    parser.add_argument('--drl_batch_size', type=int, default=DRL_BATCH_SIZE, help='DRL 批次大小 (BATCH_SIZE)')
+    parser.add_argument('--drl_gamma', type=float, default=DRL_GAMMA, help='DRL 折扣因子 (GAMMA)')
+    parser.add_argument('--drl_memory_size', type=int, default=DRL_MEMORY_SIZE, help='DRL 回放缓存区大小 (MEMORY)')
+
+    # DRL 网络架构参数
+    parser.add_argument('--resnet_hidden_size', type=int, default=RESNET_HIDDEN_SIZE, help='ResNet隐藏层大小')
+    parser.add_argument('--resnet_num_blocks', type=int, default=RESNET_NUM_BLOCKS, help='ResNet残差块数量')
 
     # 李雅普诺夫参数
-    parser.add_argument('--energy_threshold', type=float, default=500, help='李雅普诺夫队列能量阈值')
+    parser.add_argument('--energy_threshold', type=float, default=ENERGY_THRESHOLD, help='李雅普诺夫队列能量阈值')
 
     # GPU优化参数
-    parser.add_argument('--num_workers', type=int, default=4, help='数据加载器工作进程数')
-    parser.add_argument('--pin_memory', type=bool, default=True, help='是否将数据固定在内存中以加速GPU传输')
-    parser.add_argument('--non_blocking', type=bool, default=True, help='异步GPU数据传输')
+    parser.add_argument('--num_workers', type=int, default=NUM_WORKERS, help='数据加载器工作进程数')
+    parser.add_argument('--pin_memory', type=bool, default=PIN_MEMORY, help='是否将数据固定在内存中以加速GPU传输')
+    parser.add_argument('--non_blocking', type=bool, default=NON_BLOCKING, help='异步GPU数据传输')
 
     # 只保留是否需要绘图的开关
-    parser.add_argument('--plot', type=int, default=1, help='是否生成参数比较图 (0/1)')
+    parser.add_argument('--plot', type=int, default=int(PLOT_RESULTS), help='是否生成参数比较图 (0/1)')
     
     args = parser.parse_args()
     return args
@@ -74,63 +79,7 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-def _get_default_training_params(clients_manager, args):
-    """
-    获取默认的训练参数，用于第一轮或禁用DRL时。
-    选择所有可用的终端设备在本地训练，并选择第一个可用的边缘节点进行聚合。
-    """
-    clients_states = {cid: {'available': client.available, 'is_edge': client.is_edge}
-                      for cid, client in clients_manager.clients.items()}
-
-    selected_clients = [cid for cid, state in clients_states.items() 
-                      if state['available'] and not state['is_edge']]
-    
-    edge_nodes = [cid for cid, state in clients_states.items() if state['available'] and state['is_edge']]
-    
-    aggregation_location = edge_nodes[0] if edge_nodes else "cloud"
-    
-    # 本地训练，所以不需要资源分配给边缘节点
-    resource_allocation = {cid: 1.0 for cid in selected_clients}
-
-    # 在默认情况下，所有设备都在本地训练
-    drl_train_decisions = [1] * len(selected_clients)
-
-    print(f"默认决策: {len(selected_clients)} 个设备本地训练, 在 {aggregation_location} 聚合。")
-
-    training_args = {
-        'selected_nodes': selected_clients,
-        'resource_allocation': resource_allocation,
-        'aggregation_location': aggregation_location,
-        'drl_train_decisions': drl_train_decisions,
-    }
-    
-    # 添加与 training_args 严格一致的原始决策信息
-    edge_agg_decision = np.zeros(args.num_edges)
-    cloud_agg_decision = 0
-    if aggregation_location == "cloud":
-        cloud_agg_decision = 1
-    else:
-        try:
-            # 从 'edge_0', 'edge_1' 等字符串中提取索引
-            edge_idx = int(aggregation_location.split('_')[1])
-            if edge_idx < args.num_edges:
-                edge_agg_decision[edge_idx] = 1
-        except (IndexError, ValueError):
-            # 如果边缘节点ID格式不正确，则安全地回退到云聚合
-            print(f"警告: 边缘节点ID '{aggregation_location}' 格式不正确，回退到云聚合。")
-            cloud_agg_decision = 1
-
-    raw_decisions = {
-        'local_train': np.ones(len(selected_clients)),  # 全部为本地训练
-        'edge_train': np.zeros(args.num_clients * args.num_edges),
-        'edge_agg': edge_agg_decision,
-        'cloud_agg': np.array(cloud_agg_decision),
-        'resource_alloc': np.zeros(args.num_clients * args.num_edges)  # 默认本地训练，边缘无资源分配
-    }
-    
-    return training_args, raw_decisions
-
-def _log_round_stats(round_idx, episode_idx, args, training_args, raw_decisions, info, reward, accuracy, loss, server):
+def _log_round_stats(round_idx, episode_idx, args, training_args, info, reward, accuracy, loss, server):
     """记录并打印一轮的统计信息"""
     
     selected_nodes = training_args.get('selected_nodes', [])
@@ -151,14 +100,6 @@ def _log_round_stats(round_idx, episode_idx, args, training_args, raw_decisions,
     print(f"参与训练的终端设备数量: {len(terminal_devices)}")
     print(f"  - 本地训练数量: {local_train_count}")
     print(f"  - 边缘训练数量: {edge_train_count}")
-
-    if raw_decisions:
-        print("原始决策向量:")
-        print(f"  - 本地训练: {raw_decisions.get('local_train', 'N/A')}")
-        print(f"  - 边缘训练: {raw_decisions.get('edge_train', 'N/A')}")
-        print(f"  - 边缘聚合: {raw_decisions.get('edge_agg', 'N/A')}")
-        print(f"  - 云聚合:   {raw_decisions.get('cloud_agg', 'N/A')}")
-        print(f"  - 资源分配: {np.around(raw_decisions.get('resource_alloc', []), 2)}")
 
     if client_edge_mapping:
         edge_train_counts = {}
@@ -343,15 +284,18 @@ def init_system(args):
         drl_agent.load_model(args.drl_load)
         print(f"加载DRL模型: {args.drl_load}")
     print(f"创建DRL智能体: {args.drl_algo.upper()}")
+
+    # 9. 创建动作解析器
+    action_parser = ActionParser(num_devices=args.num_clients, num_edges=args.num_edges)
     
-    # 9. 同步客户端状态与环境
+    # 10. 同步客户端状态与环境
     clients_manager.update_client_states(env)
     print("同步客户端状态与环境")
     
     print("系统初始化完成")
     print("=" * 50)
     
-    return env, global_model, test_loader, clients_manager, server, drl_agent
+    return env, global_model, test_loader, clients_manager, server, drl_agent, action_parser
 
 def main():
     """主程序入口"""
@@ -371,7 +315,7 @@ def main():
         print(f"可用GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
     # 初始化系统组件
-    env, global_model, test_loader, clients_manager, server, drl_agent = init_system(args)
+    env, global_model, test_loader, clients_manager, server, drl_agent, action_parser = init_system(args)
     
     # 根据DRL超参数为本次运行创建唯一的日志文件名
     log_filename = (f"log_Lr_{args.drl_lr}_batch_{args.drl_batch_size}_"
@@ -428,66 +372,41 @@ def main():
                 round_start_time = time.time()
                 global_round_idx += 1 # 统一在循环开始时递增，使其从1开始
                 
-                # a. DRL 决策 - 根据是否为第一轮进行判断
-                if global_round_idx == 1:
-                    # 第一轮使用默认参数
-                    training_args, raw_decisions = _get_default_training_params(clients_manager, args)
-                    # 创建元组格式的默认动作 (discrete_action_tuple, continuous_action_matrix)
-                    # 这个默认动作主要用于drl_agent.learn记录，实际决策在env.step中使用了raw_decisions
-                    # 新动作空间的默认动作
-                    default_discrete_action = (
-                        np.ones(env.N, dtype=int),        # 所有设备本地训练
-                        np.zeros(env.N, dtype=int),       # 边缘选择(无效，因为本地训练=1)
-                        0                                 # 聚合选择edge_0
-                    )
-                    action = (default_discrete_action, np.zeros((env.N, env.M), dtype=np.float32))
-                else:
-                    # 后续轮次使用DRL智能体决策
-                    action = drl_agent.get_action(state)
-                    # 直接调用env的核心方法来解析动作并获取训练参数
-                    training_args, raw_decisions = env.get_fl_training_params(action, clients_manager, server)
+                # a. DRL 决策 - 始终使用DRL智能体
+                action = drl_agent.get_action(state)
                 
-                # b. 执行联邦学习训练 - 增加动作有效性检查
-                is_action_valid = env.is_action_valid(raw_decisions, episode_idx, global_round_idx)
-
-                if is_action_valid:
-                    # 动作有效，正常执行FL训练
-                    client_edge_mapping = {}
-                    if 'edge_client_mapping' in raw_decisions:
-                        client_edge_mapping = raw_decisions['edge_client_mapping']
-
-                    accuracy, global_test_loss, global_training_loss, _, _, _, is_fl_converged = server.train_round(
-                        local_training_clients=training_args['selected_nodes'],
-                        client_edge_mapping=client_edge_mapping,
-                        resource_allocation=training_args['resource_allocation'],
-                        aggregation_location=training_args['aggregation_location'],
-                        test_loader=test_loader
-                    )
-                else:
-                    # 动作无效，跳过FL训练，使用上一轮的性能指标
-                    print("  [Invalid Action] 检测到无效动作，跳过本轮FL训练。")
-                    accuracy = server.last_valid_accuracy
-                    global_test_loss = server.last_valid_test_loss
-                    global_training_loss = server.last_valid_training_loss
-                    # 标记为未收敛
-                    is_fl_converged = False
-                    # 将raw_decisions设为None，以在env.step中触发惩罚
-                    raw_decisions = None
+                # b. 解析动作为联邦学习训练参数
+                parsed_action = action_parser.parse_action_for_training(action, clients_manager, server)
+                training_args, raw_decisions = action_parser.convert_to_fl_training_params(parsed_action)
                 
-                # c. 环境步进，传入已经解析好的决策和原始动作
+                # 将客户端到边缘节点的映射信息保存到服务器中
+                if hasattr(server, 'client_edge_mapping'):
+                    server.client_edge_mapping = raw_decisions.get('edge_client_mapping', {})
+
+                # c. 执行联邦学习训练
+                client_edge_mapping = raw_decisions.get('edge_client_mapping', {})
+                accuracy, global_test_loss, global_training_loss, _, _, _, is_fl_converged = server.train_round(
+                    local_training_clients=training_args['selected_nodes'],
+                    client_edge_mapping=client_edge_mapping,
+                    resource_allocation=training_args['resource_allocation'],
+                    aggregation_location=training_args['aggregation_location'],
+                    test_loader=test_loader
+                )
+                
+                # d. 环境步进，传入已经解析好的决策和原始动作
                 next_state, reward, episode_done, info = env.step(action, raw_decisions, global_round_idx, episode_idx, global_training_loss)
                 
-                # d. DRL 智能体立即学习
+                # e. DRL 智能体立即学习
                 if args.drl_train:
                     drl_agent.learn(state, action, reward, next_state, episode_done)
 
-                # e. 更新状态
+                # f. 更新状态
                 state = next_state
                 
-                # f. 记录和打印统计信息 - 直接传递从1开始的全局轮次
-                _log_round_stats(global_round_idx, episode_idx, args, training_args, raw_decisions, info, reward, accuracy, global_test_loss, server)
+                # g. 记录和打印统计信息 - 直接传递从1开始的全局轮次
+                _log_round_stats(global_round_idx, episode_idx, args, training_args, info, reward, accuracy, global_test_loss, server)
 
-                # g. 更新统计数据
+                # h. 更新统计数据
                 training_stats['accuracy'].append(accuracy)
                 training_stats['loss'].append(global_test_loss)
                 training_stats['training_loss'].append(global_training_loss)
@@ -500,12 +419,12 @@ def main():
                 episode_losses.append(global_test_loss)
                 episode_costs.append(info.get('total_cost', 0.0))
 
-                # h. 记录每个FL轮次的详细数据到文件 - 直接使用从1开始的全局轮次
+                # i. 记录每个FL轮次的详细数据到文件 - 直接使用从1开始的全局轮次
                 log_line = f"{global_round_idx},{reward:.4f},{info.get('total_cost', 0.0):.4f},{global_test_loss:.4f},{accuracy:.4f}\n"
                 with open(round_log_path, "a") as f:
                     f.write(log_line)
 
-                # i. 更新Episode进度条的后缀信息
+                # j. 更新Episode进度条的后缀信息
                 episode_pbar.set_postfix({
                     'FL Round': f"{episode_round+1}/{args.num_rounds}",
                     'Test Loss': f"{global_test_loss:.4f}", 'Acc': f"{accuracy:.4f}", 

@@ -299,15 +299,23 @@ def create_drl_agent(args, env, **kwargs):
             'zero_index_gradients': False,        # 是否将不对应所选动作的动作参数的所有梯度归零
         }
         
-        # 创建PDQN智能体 - 注意这里的action_space是一个复合空间
-        # 它包含离散动作空间和连续动作参数空间
+        # 新增：为 ResNet 架构准备参数
+        actor_kwargs = {
+            'hidden_size': args.resnet_hidden_size,
+            'num_blocks': args.resnet_num_blocks
+        }
+        actor_param_kwargs = {
+            'hidden_size': args.resnet_hidden_size,
+            'num_blocks': args.resnet_num_blocks
+        }
+
+        # 创建PDQN智能体
         print(f"PDQN智能体使用复合动作空间: {env.action_space}")
         agent = PDQNAgent(env.observation_space, env.action_space, 
                 actor_class=QActor, 
+                actor_kwargs=actor_kwargs,
                 actor_param_class=ParamActor,
-                actor_param_kwargs={
-                    'hidden_layers': (256, 128, 64)  # 隐藏层结构
-                },
+                actor_param_kwargs=actor_param_kwargs,
                 **pdqn_params)
         return PDQNAdapter(agent, env)
     
