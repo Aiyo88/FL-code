@@ -230,7 +230,7 @@ def cifar_dirichlet(dataset, beta, num_users):
         label_distributions.append(np.random.dirichlet(np.repeat(beta, num_users)))
     
     # 获取数据集的标签
-    labels = np.array(dataset.targets).astype(np.int)
+    labels = np.array(dataset.targets).astype(int)
     
     # 初始化客户端索引映射
     dict_users = {i: np.array([], dtype=np.int64) for i in range(num_users)}
@@ -242,7 +242,7 @@ def cifar_dirichlet(dataset, beta, num_users):
         label_y_size = len(label_y_idx)
         
         # 计算每个客户端应分配的样本数量
-        sample_size = (label_distributions[y] * label_y_size).astype(np.int)
+        sample_size = (label_distributions[y] * label_y_size).astype(int)
         # 处理舍入误差
         sample_size[num_users-1] += label_y_size - np.sum(sample_size)
         

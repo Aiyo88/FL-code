@@ -84,7 +84,7 @@ def plot_training_results(log_name, save_dir="./plot", show=False):
         return
 
     try:
-        # 使用pandas读取CSV，它非常健壮
+        # 使用pandas读取CSV
         data = pd.read_csv(log_file_path)
         if data.empty:
             print(f"日志文件 {log_file_path} 为空。")
