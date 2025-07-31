@@ -385,35 +385,26 @@ class PDQNAgent(Agent):
         next_states = torch.from_numpy(next_states).to(self.device)
         terminals = torch.from_numpy(terminals).to(self.device).squeeze()
 
-        # 将动作参数分为离散部分和连续部分
-        discrete_actions = actions_combined[:, :self.num_actions_discrete]
-        continuous_parameters = actions_combined[:, self.num_actions_discrete:]
-        
-        # 离散动作现在是一个多维向量，我们需要找到每个决策的索引 (0或1)
-        # 对于二元决策，这等同于将向量本身作为动作
-        actions = discrete_actions.long()
+        # 精确分离离散动作和连续参数
+        actions = actions_combined[:, 0].long()
+        continuous_parameters = actions_combined[:, 1:]
         
         # ---------------------- optimize Q-network ----------------------
         with torch.no_grad():
-            # 获取下一状态的动作参数 (离散+连续)
-            pred_next_all_action_parameters = self.actor_param_target.forward(next_states)
+            # 获取下一状态的动作参数
+            pred_next_continuous_parameters = self.actor_param_target.forward(next_states)
             
             # 使用目标网络评估下一状态的Q值
-            # 注意：QActor的输出现在是一个向量，每个元素对应一个离散决策的Q值
-            pred_Q_a = self.actor_target(next_states, pred_next_all_action_parameters)
+            pred_Q_a = self.actor_target(next_states, pred_next_continuous_parameters)
             
-            # 选择每个决策维度上的最大Q值
-            # pred_Q_a 的形状是 (batch, num_actions_discrete * 2)
-            q_values_reshaped = pred_Q_a.view(-1, self.num_actions_discrete, 2)
-            Qprime_per_dim, _ = torch.max(q_values_reshaped, dim=2)
-            Qprime = Qprime_per_dim.sum(dim=1) # 对所有决策的Q值求和
+            # 选择最大Q值作为下一状态的价值
+            Qprime, _ = torch.max(pred_Q_a, 1)
 
             # 计算TD目标
             target = rewards + (1 - terminals) * self.gamma * Qprime
 
         # 计算当前策略的Q值
-        # QActor的输出需要调整以匹配多维离散动作
-        q_values_all = self.actor(states, actions_combined)
+        q_values_all = self.actor(states, continuous_parameters)
         
         # 收集与所采取的离散动作对应的Q值
         y_predicted = q_values_all.gather(1, actions.unsqueeze(1)).squeeze(1)
@@ -447,17 +438,8 @@ class PDQNAgent(Agent):
             action_params = self.actor_param(states)
         action_params.requires_grad = True
         
-        # 计算策略网络输出的Q值
         Q = self.actor(states, action_params)
-        
-        # 对于多维决策，总Q值是每个决策维度的最大Q值之和
-        q_values_reshaped = Q.view(-1, self.num_actions_discrete, 2)
-        q_max_per_dim, _ = torch.max(q_values_reshaped, dim=2)
-        Q_val = q_max_per_dim.sum(dim=1)
-        
-        # 根据设置应用加权策略 (这里可能需要重新思考加权逻辑)
-        if self.weighted or self.average or self.random_weighted:
-            print("警告: 加权方案在MultiDiscrete动作空间下可能无法按预期工作。")
+        Q_val = Q.gather(1, torch.argmax(Q, dim=1).unsqueeze(1)).squeeze(1)
             
         # 计算策略网络的损失
         Q_loss = -torch.mean(Q_val) # 我们希望最大化Q值，所以最小化其负值
