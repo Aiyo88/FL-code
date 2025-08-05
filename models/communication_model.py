@@ -9,7 +9,7 @@
 """
 
 import numpy as np
-from config import RAYLEIGH_SCALE, CORRELATION_FACTOR, MIN_CHANNEL_GAIN, EDGE_TO_EDGE_RATE
+from config import RAYLEIGH_SCALE, CORRELATION_FACTOR, MIN_CHANNEL_GAIN, EDGE_TO_EDGE_RATE, PT_DEVICE_RECEIVE
 
 
 class WirelessCommunicationModel:
@@ -146,21 +146,32 @@ class WirelessCommunicationModel:
             is_uplink: 是否为上行传输
             
         Returns:
-            (延迟, 能耗): 传输延迟和能耗
+            (延迟, 发送能耗, 接收能耗): 传输延迟和两端的能耗
         """
         if is_uplink:
             rate = self.get_uplink_rate(device_idx, edge_idx)
-            power = self.Pt_UP
+            transmit_power_dbm = self.Pt_UP
+            # 假设边缘节点的接收功率等于其发送功率
+            receive_power_dbm = self.Pt_edge_transmit 
         else:
             rate = self.get_downlink_rate(device_idx, edge_idx)
-            power = self.Pt_down
+            transmit_power_dbm = self.Pt_down
+            # 设备接收功率
+            receive_power_dbm = PT_DEVICE_RECEIVE
         
         if rate > 0:
             delay = data_size / rate
-            energy = power * delay
-            return delay, energy
+            
+            # 将dBm转换为线性功率 (W)
+            transmit_power_watt = 10**(transmit_power_dbm / 10) * 1e-3
+            receive_power_watt = 10**(receive_power_dbm / 10) * 1e-3
+
+            transmit_energy = transmit_power_watt * delay
+            receive_energy = receive_power_watt * delay
+            
+            return delay, transmit_energy, receive_energy
         else:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
     
     def calculate_edge_to_cloud_delay_energy(self, data_size, is_uplink=True):
         """

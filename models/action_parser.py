@@ -110,22 +110,20 @@ class ActionParser:
             if local_train[i] == 1:
                 client_id = f"client{i}"
                 selected_nodes.append(client_id)
-                resource_allocation[client_id] = 1.0 # 本地训练独占资源
+                # 任务标识符: (执行节点, 代理客户端) -> 资源比例
+                resource_allocation[(client_id, client_id)] = 1.0 # 本地训练独占资源
         
         # 卸载训练的客户端 (由边缘节点代理)
-        edge_clients_map = {}
         for client_id, edge_id in client_edge_mapping.items():
             if edge_id not in selected_nodes:
                 selected_nodes.append(edge_id)
             
-            if edge_id not in edge_clients_map:
-                edge_clients_map[edge_id] = []
-            edge_clients_map[edge_id].append(client_id)
-            
-            # 资源分配是针对边缘节点的
             client_idx = int(client_id.replace("client", ""))
             edge_idx = int(edge_id.replace("edge_", ""))
-            resource_allocation[edge_id] = resource_allocation.get(edge_id, 0) + res_alloc[client_idx, edge_idx]
+            
+            # 任务标识符: (执行节点, 代理客户端) -> 资源比例
+            ratio = res_alloc[client_idx, edge_idx]
+            resource_allocation[(edge_id, client_id)] = ratio
 
         # 准备 training_args
         training_args = {

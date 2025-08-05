@@ -9,45 +9,37 @@
 """
 
 import numpy as np
+from config import ENERGY_REPLENISH_RATE
 
 
 class LyapunovQueue:
     """李雅普诺夫能量队列类 - 实现能量队列的更新、李雅普诺夫函数、漂移计算及稳定性判定"""
     
-    def __init__(self, e_avg):
+    def __init__(self):
         """
         初始化李雅普诺夫队列
+        """
+        self.queue = 0.0    # 能量队列初始值 (代表能量赤字)
+        
+    def update_queue(self, energy_consumed, energy_replenished=ENERGY_REPLENISH_RATE):
+        """
+        更新能量队列: Q(t+1) = max{0, Q(t) + E_consumed(t) - E_replenished(t)}
         
         Args:
-            e_avg: 平均能量消耗阈值
-        """
-        self.e_avg = e_avg  # 平均能量消耗阈值
-        self.queue = 0.0    # 能量队列初始值
-        
-    def update_queue(self, e_u_t):
-        """
-        更新能量队列: Q(t+1) = max{Q(t) - E_avg, 0} + E(t)
-        
-        Args:
-            e_u_t: 当前时隙的能量消耗
+            energy_consumed: 当前时隙消耗的能量
+            energy_replenished: 当前时隙补充的能量
             
         Returns:
             更新后的队列值
         """
-        self.queue = max(0, self.queue - self.e_avg) + e_u_t
+        self.queue = max(0, self.queue + energy_consumed - energy_replenished)
         return self.queue
     
-    def q_u_compute(self, e_u_t):
+    def q_u_compute(self, energy_consumed, energy_replenished=ENERGY_REPLENISH_RATE):
         """
         计算队列更新后的值，但不实际更新队列
-        
-        Args:
-            e_u_t: 当前时隙的能量消耗
-            
-        Returns:
-            预计的队列值
         """
-        return max(0, self.queue - self.e_avg) + e_u_t
+        return max(0, self.queue + energy_consumed - energy_replenished)
     
     def lyapunov_function(self):
         """
@@ -58,30 +50,30 @@ class LyapunovQueue:
         """
         return 0.5 * self.queue**2
     
-    def lyapunov_drift(self, e_u_t):
+    def lyapunov_drift(self, energy_consumed):
         """
         计算李雅普诺夫漂移: ΔL = L(Q(t+1)) - L(Q(t))
         
         Args:
-            e_u_t: 当前时隙的能量消耗
+            energy_consumed: 当前时隙的能量消耗
             
         Returns:
             李雅普诺夫漂移值
         """
-        q_next = self.q_u_compute(e_u_t)
+        q_next = self.q_u_compute(energy_consumed)
         return 0.5 * q_next**2 - self.lyapunov_function()
     
-    def is_stable(self, e_u_t):
+    def is_stable(self, energy_consumed):
         """
         判断队列是否稳定: 如果漂移小于等于0，则队列稳定
         
         Args:
-            e_u_t: 当前时隙的能量消耗
+            energy_consumed: 当前时隙的能量消耗
             
         Returns:
             是否稳定
         """
-        return self.lyapunov_drift(e_u_t) <= 0
+        return self.lyapunov_drift(energy_consumed) <= 0
 
 
 class LyapunovQueueManager:
@@ -97,11 +89,11 @@ class LyapunovQueueManager:
         """
         self.num_devices = num_devices
         self.energy_threshold = energy_threshold
-        self.queues = [LyapunovQueue(e_avg=energy_threshold) for _ in range(num_devices)]
+        self.queues = [LyapunovQueue() for _ in range(num_devices)]
     
     def reset_queues(self):
         """重置所有队列"""
-        self.queues = [LyapunovQueue(e_avg=self.energy_threshold) for _ in range(self.num_devices)]
+        self.queues = [LyapunovQueue() for _ in range(self.num_devices)]
     
     def update_all_queues(self, energy_consumptions):
         """

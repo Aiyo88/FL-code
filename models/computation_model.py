@@ -9,7 +9,7 @@
 """
 
 import numpy as np
-from config import F_L_MIN, F_L_MAX, F_E_MIN, F_E_MAX, COMPUTE_COMPLEXITY_MIN, COMPUTE_COMPLEXITY_MAX
+from config import F_L_MIN, F_L_MAX, F_E_MIN, F_E_MAX, COMPUTE_COMPLEXITY_MIN, COMPUTE_COMPLEXITY_MAX, COMPUTATION_ENERGY_SCALE
 
 
 class ComputationModel:
@@ -75,7 +75,7 @@ class ComputationModel:
         
         # 计算延迟和能耗
         delay = data_size * cycles_per_bit / compute_freq
-        energy = 1e-27 * (compute_freq)**3 * delay
+        energy = 1e-27 * (compute_freq)**3 * delay * COMPUTATION_ENERGY_SCALE
         
         return delay, energy
         
@@ -110,7 +110,7 @@ class ComputationModel:
         
         # 计算延迟和能耗
         delay = data_size * cycles_per_bit / compute_freq
-        energy = 1e-27 * (compute_freq)**3 * delay
+        energy = 1e-27 * (compute_freq)**3 * delay * COMPUTATION_ENERGY_SCALE
         
         return delay, energy
         
