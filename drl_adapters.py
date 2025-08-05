@@ -18,6 +18,9 @@ class DRLAdapter:
         self.env = env
         self.device = getattr(agent, 'device', torch.device("cpu"))
         
+        # 存储当前Episode的完整经验轨迹
+        self.episode_buffer = []
+        
         # 获取环境参数
         self.N = getattr(env, 'N', 5)  # 终端设备数量
         self.M = getattr(env, 'M', 2)   # 边缘节点数量
@@ -43,11 +46,12 @@ class DRLAdapter:
         raise NotImplementedError("需要由子类实现")
     
     def learn(self, state, action, reward, next_state, done):
-        """在每个时间步后调用此方法来训练智能体。
-        
-        此方法封装了"存储经验"和"执行一步学习"两个过程。
-        子类必须实现此方法。
-        """
+        """在每个时间步后调用此方法来存储经验。"""
+        # 只存储经验，不立即学习
+        self.episode_buffer.append((state, action, reward, next_state, done))
+
+    def learn_from_episode(self):
+        """在Episode结束后，调用此方法进行批量学习。"""
         raise NotImplementedError("需要由子类实现")
     
     def save_model(self, path):
@@ -91,23 +95,40 @@ class PDQNAdapter(DRLAdapter):
         return self.agent.select_action(state)
     
     def learn(self, state, action, reward, next_state, done):
-        """训练智能体
-        
-        Args:
-            state: 环境状态
-            action: 动作元组(discrete_action, continuous_action)
-            reward: 奖励
-            next_state: 下一个状态
-            done: 是否结束
         """
-        # 确保状态是numpy数组
-        if isinstance(state, list):
-            state = np.array(state, dtype=np.float32)
-        if isinstance(next_state, list):
-            next_state = np.array(next_state, dtype=np.float32)
-        
-        # 直接将元组格式的动作传递给agent.store方法
-        self.agent.store(state, action, reward, next_state, done)
+        在每个时间步仅存储经验到临时缓冲区。
+        """
+        # (state, action, reward, next_state, done)
+        self.episode_buffer.append((state, action, reward, next_state, done))
+
+    def learn_from_episode(self):
+        """
+        在Episode结束后，将整个Episode的数据传递给Agent进行批量学习。
+        """
+        if not self.episode_buffer:
+            return
+
+        # 1. 从缓冲区解构数据
+        states = [e[0] for e in self.episode_buffer]
+        actions = [e[1] for e in self.episode_buffer]
+        rewards = np.array([e[2] for e in self.episode_buffer])
+        next_states = [e[3] for e in self.episode_buffer]
+        terminals = np.array([e[4] for e in self.episode_buffer])
+
+        episode_data = {
+            'states': states,
+            'actions': actions,
+            'rewards': rewards,
+            'next_states': next_states,
+            'terminals': terminals
+        }
+
+        # 2. 调用Agent的核心回合制学习方法
+        if hasattr(self.agent, 'learn_from_episode_data'):
+            self.agent.learn_from_episode_data(episode_data)
+
+        # 3. 清空缓冲区，为下一个Episode做准备
+        self.episode_buffer = []
     
     def save_model(self, path):
         """保存模型"""
@@ -122,8 +143,10 @@ class PDQNAdapter(DRLAdapter):
     
     def load_model(self, path):
         """加载模型"""
-        if not os.path.exists(path + '_actor.pt'):
-            print(f"警告：模型路径 {path}_actor.pt 不存在")
+        # 检查第一个Q网络模型文件是否存在以判断模型是否可用
+        actor1_path = path + '_q_actor1.pt'
+        if not os.path.exists(actor1_path):
+            print(f"警告：模型路径 {actor1_path} 不存在")
             return
         
         # 使用PDQN的load_models方法
@@ -285,8 +308,9 @@ def create_drl_agent(args, env, **kwargs):
             'batch_size': min(args.drl_batch_size, 256),  # 限制批次大小，提高学习稳定性
             'gamma': args.drl_gamma,
             'replay_memory_size': args.drl_memory_size,
-            'learning_rate_actor': args.drl_lr * 0.5,    # 降低学习率，提高收敛稳定性
-            
+            'learning_rate_actor': args.drl_lr * 0.1,    # 大幅降低学习率
+            'learning_rate_actor_param': args.drl_lr * 0.1, # 大幅降低学习率
+
             # 保留部分固定参数
             'inverting_gradients': True, # 使用梯度反转方案
             'initial_memory_threshold': 32,   # 进一步降低，更早开始学习
@@ -299,14 +323,14 @@ def create_drl_agent(args, env, **kwargs):
             'zero_index_gradients': False,        # 是否将不对应所选动作的动作参数的所有梯度归零
         }
         
-        # 新增：为 ResNet 架构准备参数
+        # 新增：为 GNN 架构准备参数
         actor_kwargs = {
-            'hidden_size': args.resnet_hidden_size,
-            'num_blocks': args.resnet_num_blocks
+            'hidden_dim': args.resnet_hidden_size, # 复用参数
+            'num_heads': 4
         }
         actor_param_kwargs = {
-            'hidden_size': args.resnet_hidden_size,
-            'num_blocks': args.resnet_num_blocks
+            'hidden_dim': args.resnet_hidden_size, # 复用参数
+            'num_heads': 4
         }
 
         # 创建PDQN智能体

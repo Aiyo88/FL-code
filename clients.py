@@ -168,53 +168,41 @@ class ClientsGroup:
         self.edge_nodes = {}
         self.test_data = None
 
-    def setup_infrastructure(self, data_dict, test_data):
-        self.test_data = test_data
-        self._setup_clients(data_dict)
+    def setup_infrastructure(self, train_data):
+        self._setup_clients(train_data)
         self._setup_edge_nodes()
         self._connect_clients_to_edges()
 
-    def _setup_clients(self, data_dict):
-        # 正确从env_datasets字典中提取训练数据
-        if isinstance(data_dict, dict) and 'train_data' in data_dict:
-            # 获取训练数据集
-            train_data = data_dict['train_data']
-            
-            # 根据IID/非IID设置划分数据
-            from utils.sampling import mnist_iid, mnist_noniid, cifar_iid, cifar_noniid
-            
-            # 如果是数据加载器，获取其中的数据集
-            if hasattr(train_data, 'dataset'):
-                dataset = train_data.dataset
-            else:
-                dataset = train_data
-                
-            # 根据dataset_name和IID设置决定使用哪个函数
-            if self.is_iid:
-                user_groups = mnist_iid(dataset, self.num_clients) if self.dataset_name.lower() == 'mnist' else cifar_iid(dataset, self.num_clients)
-            else:
-                user_groups = mnist_noniid(dataset, self.num_clients) if self.dataset_name.lower() == 'mnist' else cifar_noniid(dataset, self.num_clients)
-            
-            # 为每个客户端分配数据
-            from torch.utils.data import Subset
-            for i in range(self.num_clients):
-                client_id = f"client{i}"
-                
-                # 如果数据分配中有该客户端的索引
-                if i in user_groups and len(user_groups[i]) > 0:
-                    # 创建数据子集
-                    client_data = Subset(dataset, list(user_groups[i]))
-                else:
-                    client_data = None
-                
-                # 创建客户端实例
-                self.clients[client_id] = Client(client_data, self.device, client_id)
+    def _setup_clients(self, train_data):
+        # 根据IID/非IID设置划分数据
+        from utils.sampling import mnist_iid, mnist_noniid, cifar_iid, cifar_noniid
+        
+        # 如果是数据加载器，获取其中的数据集
+        if hasattr(train_data, 'dataset'):
+            dataset = train_data.dataset
         else:
-            # 旧的处理方式，保留以兼容现有代码
-            for i in range(self.num_clients):
-                client_id = f"client{i}"
-                client_data = data_dict.get(i)
-                self.clients[client_id] = Client(client_data, self.device, client_id)
+            dataset = train_data
+            
+        # 根据dataset_name和IID设置决定使用哪个函数
+        if self.is_iid:
+            user_groups = mnist_iid(dataset, self.num_clients) if self.dataset_name.lower() == 'mnist' else cifar_iid(dataset, self.num_clients)
+        else:
+            user_groups = mnist_noniid(dataset, self.num_clients) if self.dataset_name.lower() == 'mnist' else cifar_noniid(dataset, self.num_clients)
+        
+        # 为每个客户端分配数据
+        from torch.utils.data import Subset
+        for i in range(self.num_clients):
+            client_id = f"client{i}"
+            
+            # 如果数据分配中有该客户端的索引
+            if i in user_groups and len(user_groups[i]) > 0:
+                # 创建数据子集
+                client_data = Subset(dataset, list(user_groups[i]))
+            else:
+                client_data = None
+            
+            # 创建客户端实例
+            self.clients[client_id] = Client(client_data, self.device, client_id)
 
     def _setup_edge_nodes(self):
         for i in range(self.num_edges):

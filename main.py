@@ -6,6 +6,7 @@ import time
 import sys
 from tqdm import tqdm
 import tqdm.notebook as tqdm_notebook
+from torch.utils.data import DataLoader
 
 # 导入自定义模块
 from utils.data_utils import get_dataset, get_client_dataset
@@ -97,17 +98,19 @@ def _log_round_stats(round_idx, episode_idx, args, training_args, info, reward, 
     total_cost = info.get("total_cost", 0.0)
     
     print(f"\n===== DRL Episode {episode_idx}, FL轮次 {round_idx} 结果 =====")
-    print(f"参与训练的终端设备数量: {len(terminal_devices)}")
+    print(f"参与训练的客户端总数: {len(drl_train_decisions)}")
     print(f"  - 本地训练数量: {local_train_count}")
     print(f"  - 边缘训练数量: {edge_train_count}")
-
+    print(f"实际执行训练的节点数: {len(selected_nodes)}")
+    
+    # 统计各边缘节点的负载
     if client_edge_mapping:
         edge_train_counts = {}
         for _, edge_id in client_edge_mapping.items():
             edge_train_counts[edge_id] = edge_train_counts.get(edge_id, 0) + 1
-        print("卸载到各边缘节点的决策:")
+        print("边缘节点训练负载:")
         for edge_id, count in edge_train_counts.items():
-            print(f"  - {edge_id}: {count}个设备")
+            print(f"  - {edge_id}: 为{count}个客户端训练")
     
     print(f"聚合位置: {aggregation_location}")
     print(f"奖励: {reward:.4f}")
@@ -206,8 +209,33 @@ def init_system(args):
     print("=" * 50)
     print("初始化系统...")
     
-    # 1. 创建环境
-    env = Env(num_devices=args.num_clients, num_edges=args.num_edges, energy_threshold=args.energy_threshold)
+    # 1. 创建客户端管理器和数据集（顺序调整）
+    clients_manager = ClientsGroup(
+        dataset_name=args.dataset, 
+        is_iid=bool(args.iid), 
+        num_clients=args.num_clients,
+        device=device,
+        num_edges=args.num_edges,
+        non_iid_level=args.non_iid_level
+    )
+    
+    # 2. 准备数据集
+    print("准备数据集...")
+    if not os.path.exists(args.data_path):
+        os.makedirs(args.data_path)
+    train_data, test_loader = get_dataset(args.dataset, args.data_path, args.batch_size) # get_dataset 直接返回 test_loader
+    
+    # 使用准备好的数据来设置客户端的基础设施
+    clients_manager.setup_infrastructure(train_data=train_data)
+    print(f"创建客户端管理器: 客户端数量={args.num_clients}, 边缘节点数量={args.num_edges}, {'IID' if args.iid else f'非IID-L{args.non_iid_level}'} 数据分布")
+
+    # 3. 创建环境，并传入clients_manager以获取连接信息
+    env = Env(
+        num_devices=args.num_clients, 
+        num_edges=args.num_edges, 
+        energy_threshold=args.energy_threshold,
+        clients_manager=clients_manager  # <--- 传入管理器
+    )
     print(f"创建环境: 终端设备={env.N}, 边缘节点={env.M}")
     
     # 在加载数据集部分之前添加：
@@ -220,17 +248,17 @@ def init_system(args):
         os.makedirs(args.data_path)
         print(f"Created data directory: {args.data_path}")
         
-    # 2. 环境初始化数据集
-    print("环境初始化数据集...")
-    env_datasets, test_loader = env.initialize_dataset(
-        args.dataset,
-        bool(args.iid),
-        args.non_iid_level,
-        args.data_path
-    )
-    print(f"数据集初始化完成: '{args.dataset}', {'IID' if args.iid else f'非IID-L{args.non_iid_level}'}")
+    # 4. 环境初始化数据集 (不再需要，因为数据已在客户端管理器中处理)
+    # print("环境初始化数据集...")
+    # env_datasets, test_loader = env.initialize_dataset(
+    #     args.dataset,
+    #     bool(args.iid),
+    #     args.non_iid_level,
+    #     args.data_path
+    # )
+    # print(f"数据集初始化完成: '{args.dataset}', {'IID' if args.iid else f'非IID-L{args.non_iid_level}'}")
     
-    # 3. 初始化模型
+    # 5. 初始化模型
     print("初始化模型...")
     # 修正：根据数据集类型强制选择正确的模型，避免命令行参数混淆
     if args.dataset == 'mnist':
@@ -242,21 +270,6 @@ def init_system(args):
 
     global_model = create_model(model_name)
     global_model = global_model.to(device)
-    
-    # 4. 创建客户端管理器 - 现在只进行基本初始化
-    clients_manager = ClientsGroup(
-        dataset_name=args.dataset, 
-        is_iid=bool(args.iid), 
-        num_clients=args.num_clients,
-        device=device,
-        num_edges=args.num_edges,
-        non_iid_level=args.non_iid_level
-    )
-    
-    # 5. 使用由Env准备好的数据来设置客户端的基础设施
-    clients_manager.setup_infrastructure(data_dict=env_datasets, test_data=test_loader.dataset)
-    
-    print(f"创建客户端管理器: 客户端数量={args.num_clients}, 边缘节点数量={args.num_edges}, {'IID' if args.iid else f'非IID-L{args.non_iid_level}'} 数据分布")
     
     # 6. 创建服务器
     server_args = {
@@ -396,7 +409,7 @@ def main():
                 # d. 环境步进，传入已经解析好的决策和原始动作
                 next_state, reward, episode_done, info = env.step(action, raw_decisions, global_round_idx, episode_idx, global_training_loss)
                 
-                # e. DRL 智能体立即学习
+                # e. DRL 智能体仅存储经验
                 if args.drl_train:
                     drl_agent.learn(state, action, reward, next_state, episode_done)
 
@@ -440,6 +453,10 @@ def main():
                 if episode_done:
                     print(f"===== DRL Episode {episode_idx} 因环境信号而提前结束 (在FL轮次 {episode_round+1}) =====")
                     break
+
+            # 3. Episode结束后: 执行回合制学习
+            if args.drl_train and hasattr(drl_agent, 'learn_from_episode'):
+                drl_agent.learn_from_episode()
 
             # Episode结束后的处理
             if episode_rewards:

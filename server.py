@@ -11,9 +11,48 @@ from torch.utils.data import DataLoader
 # 使用新的模型导入
 from models.models import create_model
 import torch.nn as nn
+from concurrent.futures import ThreadPoolExecutor
 
 # 导入配置参数
 from config import *
+
+def train_node(node, model, global_parameters, lr, local_epochs, edge_to_clients_map, clients_manager, resource_allocation):
+    """辅助函数，用于在单独的线程中训练一个节点"""
+    node_id = node.client_id
+    if not node or not node.available:
+        print(f"节点 {node_id} 不可用，跳过")
+        return None
+
+    results = []
+    if node.is_edge:
+        client_ids_on_this_edge = edge_to_clients_map.get(node_id, [])
+        for client_id in client_ids_on_this_edge:
+            client_on_behalf_of = clients_manager.clients.get(client_id)
+            if client_on_behalf_of:
+                # 查找此特定任务的资源分配比例
+                alloc_ratio = resource_allocation.get((node_id, client_id), 1.0)
+                params, gradients, loss, train_time, data_size = node.train(
+                    model=copy.deepcopy(model),
+                    global_parameters=global_parameters,
+                    lr=lr,
+                    local_epochs=local_epochs,
+                    client_on_behalf_of=client_on_behalf_of,
+                    allocation_ratio=alloc_ratio
+                )
+                results.append((client_id, params, gradients, loss, train_time, data_size))
+    else:
+        # 本地训练，资源分配比例为1.0
+        alloc_ratio = resource_allocation.get((node_id, node_id), 1.0)
+        params, gradients, loss, train_time, data_size = node.train(
+            model=copy.deepcopy(model),
+            global_parameters=global_parameters,
+            lr=lr,
+            local_epochs=local_epochs,
+            allocation_ratio=alloc_ratio
+        )
+        results.append((node_id, params, gradients, loss, train_time, data_size))
+    
+    return results
 
 class FederatedServer:
     """联邦学习服务器 - 处理模型聚合与评估"""
@@ -177,35 +216,17 @@ class FederatedServer:
         aggregation_time = time.time() - start_time
         return aggregated_parameters, aggregated_gradient, aggregation_time
     
-    def _check_convergence(self, new_params):
-        """检查模型是否满足 ||ω^t - ω*|| ≤ ε
+    def _check_convergence(self, new_params=None):
+        """检查模型是否满足收敛条件
         
-        计算当前参数与最优参数之间的欧氏距离，判断是否收敛
-        
-        Args:
-            new_params: 新的模型参数
-            
-        Returns:
-            is_converged: 布尔值，表示是否收敛
+        判断依据是上一轮聚合后的模型参数变化量是否足够小。
+        这个变化量 (self.best_delta) 是在 update_global_model 中计算的。
         """
-        if self.best_params is None:
-            self.best_params = copy.deepcopy(new_params)
-            self.convergence_deltas.append(float('inf'))
-            return False
-        
-        # 计算参数变化
-        param_delta = 0.0
-        for name in new_params:
-            if name in self.best_params:
-                param_delta += torch.norm(new_params[name] - self.best_params[name]).item()
+        # 直接使用在 update_global_model 中计算好的、与上一轮模型的参数变化量
+        param_delta = self.best_delta
         
         self.convergence_deltas.append(param_delta)
 
-        # 更新最优参数
-        if param_delta < self.best_delta:
-            self.best_params = copy.deepcopy(new_params)
-            self.best_delta = param_delta
-        
         # 检查收敛耐心
         if param_delta < CONVERGENCE_EPSILON:
             self.patience_counter += 1
@@ -232,7 +253,9 @@ class FederatedServer:
         """
         if aggregation_location == "cloud":
             aggregated_parameters, aggregated_gradient, aggregation_time = self.cloud_aggregate(updates_dict, data_sizes, gradients_dict)
-            is_converged = self._check_convergence(aggregated_parameters)
+            # 注意：update_global_model 必须在 check_convergence 之前调用，以计算正确的 param_delta
+            self.update_global_model(aggregated_parameters)
+            is_converged = self._check_convergence()
             return aggregated_parameters, aggregated_gradient, aggregation_time, is_converged
         else:
             # 边缘聚合不检查收敛性
@@ -329,7 +352,7 @@ class FederatedServer:
     def _orchestrate_training(self, selected_nodes, client_edge_mapping, resource_allocation):
         """
         统一的训练协调函数。
-        根据映射关系，自动调用 Client.train 或 EdgeNode.train。
+        根据映射关系，并行调用 Client.train 或 EdgeNode.train。
         """
         updates, grads, data_sizes, losses, train_times = {}, {}, {}, {}, {}
         
@@ -346,78 +369,75 @@ class FederatedServer:
         
         # 调试信息
         print("\n======== 训练调试信息 ========")
-        print(f"训练节点数量: {len(selected_nodes)}")
+        print(f"实际执行训练的节点数: {len(selected_nodes)}")
         print(f"客户端到边缘节点映射: {client_edge_mapping}")
         
-        with tqdm(total=len(selected_nodes), desc='客户端训练', disable=self.disable_progress_bar) as pbar:
+        # 统计信息
+        local_train_count = len([n for n in selected_nodes if n.startswith('client')])
+        edge_train_count = len([n for n in selected_nodes if n.startswith('edge')])
+        total_clients = local_train_count
+        if client_edge_mapping:
+            total_clients += len(client_edge_mapping)
+        
+        print(f"参与训练的客户端总数: {total_clients}")
+        print(f"  - 本地训练的客户端: {local_train_count}")
+        print(f"  - 边缘训练的客户端: {len(client_edge_mapping) if client_edge_mapping else 0}")
+        print(f"  - 执行训练的边缘节点: {edge_train_count}")
+
+        # 使用ThreadPoolExecutor实现并行训练
+        with ThreadPoolExecutor() as executor:
+            futures = []
             for node_id in selected_nodes:
                 node = self.clients_manager.clients.get(node_id)
-                if not node or not node.available:
-                    print(f"节点 {node_id} 不可用，跳过")
+                future = executor.submit(
+                    train_node,
+                    node,
+                    self.model,
+                    self.global_parameters,
+                    self.args.get('lr', 0.01),
+                    self.args.get('epochs', 3),
+                    edge_to_clients_map,
+                    self.clients_manager,
+                    resource_allocation  # <--- 传递新的resource_allocation字典
+                )
+                futures.append(future)
+
+            with tqdm(total=len(futures), desc='客户端并行训练', disable=self.disable_progress_bar) as pbar:
+                for future in futures:
+                    try:
+                        results = future.result()
+                        if results:
+                            for result_tuple in results:
+                                client_id, params, gradients, loss, train_time, data_size = result_tuple
+                                
+                                updates[client_id] = params
+                                grads[client_id] = gradients
+                                data_sizes[client_id] = data_size
+                                losses[client_id] = loss
+                                train_times[client_id] = train_time
+                                
+                                if data_size > 0:
+                                    total_samples += data_size
+                                    total_loss += loss * data_size
+
+                                if client_id.startswith('client'):
+                                     print(f"本地客户端 {client_id} 训练完成, 损失: {loss:.6f}, 数据量: {data_size}")
+                                else:
+                                     print(f"边缘节点为客户端 {client_id} 训练完成, 损失: {loss:.6f}, 数据量: {data_size}")
+
+                    except Exception as e:
+                        print(f"一个训练线程发生错误: {e}")
                     pbar.update(1)
-                    continue
 
-                res_alloc = resource_allocation.get(node_id, 1.0)
-                
-                if node.is_edge:
-                    client_ids_on_this_edge = edge_to_clients_map.get(node_id, [])
-                    for client_id in client_ids_on_this_edge:
-                        client_on_behalf_of = self.clients_manager.clients.get(client_id)
-                        if client_on_behalf_of:
-                            params, gradients, loss, train_time, data_size = node.train(
-                                model=copy.deepcopy(self.model),
-                                global_parameters=self.global_parameters,
-                                lr=self.args.get('lr', 0.01),
-                                local_epochs=self.args.get('epochs', 3),
-                                client_on_behalf_of=client_on_behalf_of
-                            )
-                            updates[client_id] = params
-                            grads[client_id] = gradients
-                            data_sizes[client_id] = data_size
-                            losses[client_id] = loss
-                            train_times[client_id] = train_time
-                            
-                            print(f"边缘节点 {node_id} 为客户端 {client_id} 训练, 损失: {loss:.6f}, 数据量: {data_size}")
-                            
-                            # 累加样本数和损失值
-                            if data_size > 0:
-                                total_samples += data_size
-                                total_loss += loss * data_size  # 加权损失
-                else:
-                    params, gradients, loss, train_time, data_size = node.train(
-                        model=copy.deepcopy(self.model),
-                        global_parameters=self.global_parameters,
-                        lr=self.args.get('lr', 0.01),
-                        local_epochs=self.args.get('epochs', 3)
-                    )
-                    updates[node_id] = params
-                    grads[node_id] = gradients
-                    data_sizes[node_id] = data_size
-                    losses[node_id] = loss
-                    train_times[node_id] = train_time
-                    
-                    print(f"本地客户端 {node_id} 训练, 损失: {loss:.6f}, 数据量: {data_size}")
-                    
-                    # 累加样本数和损失值
-                    if data_size > 0:
-                        total_samples += data_size
-                        total_loss += loss * data_size  # 加权损失
-
-                pbar.update(1)
-        
-        # 确保在没有有效训练数据时不会导致除零错误
         if total_samples > 0:
             avg_loss = total_loss / total_samples
             print(f"计算平均损失: 总损失 {total_loss:.6f} / 总样本数 {total_samples} = {avg_loss:.6f}")
-            
-            # 确保所有客户端都有有效的损失值
             for client_id in losses:
                 if losses[client_id] == 0 and data_sizes[client_id] > 0:
-                    print(f"客户端 {client_id} 损失为0，使用平均损失 {avg_loss:.6f}")
                     losses[client_id] = avg_loss
         else:
             print("警告: 没有有效的训练数据，无法计算平均损失")
-            
+
         print("数据大小统计:", data_sizes)
         print("损失统计:", losses)
         print("===========================\n")

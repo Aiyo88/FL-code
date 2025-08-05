@@ -33,8 +33,8 @@ NON_IID_LEVEL = 1             # 非IID程度 (1/2/3)
 NUM_ROUNDS = 100               # 联邦学习轮数
 NUM_EPISODES = 200             # DRL训练的Episode总数上限
 FL_ROUNDS_PER_EPISODE = 100    # 每个DRL Episode包含的FL轮次数量
-LOCAL_EPOCHS = 5               # 本地训练轮数
-BATCH_SIZE = 1024              # 批次大小
+LOCAL_EPOCHS = 1               # 本地训练轮数 (原为5)
+BATCH_SIZE = 512               # 批次大小 (原为2048)
 LEARNING_RATE = 0.001          # 联邦学习学习率
 MOMENTUM = 0.9                 # 动量
 WEIGHT_DECAY = 1e-5            # 权重衰减
@@ -70,6 +70,7 @@ NUM_CLOUD_SERVERS = 1          # 云服务器数量
 # 李雅普诺夫队列参数
 ENERGY_THRESHOLD = 500         # 李雅普诺夫队列能量阈值
 ENERGY_MAX = 500              # 最大能量
+ENERGY_REPLENISH_RATE = 5.0   # 设备每轮补充的能量 (J) (原为20.0)
 CONVERGENCE_EPSILON_ENV = 1e-3 # 环境收敛阈值
 
 # 数据和模型大小
@@ -77,13 +78,14 @@ DEFAULT_DATA_SIZE = 10 * 1024 * 1024   # 10MB 默认数据大小
 DEFAULT_MODEL_SIZE = 2 * 1024 * 1024   # 2MB 默认模型大小
 
 # 时间模型
-TIME_SLOT = 0.1                # 时隙长度
+TIME_SLOT = 100.0                # 时隙长度 (原为0.1)
 
 # 通信模型参数
 BANDWIDTH = 6                  # 信道带宽 (MHz)
 NOISE_POWER = 10e-13          # 噪声功率
 PT_UP = 24                    # 上行传输功率 (dBm)
 PT_DOWN = 30                  # 下行传输功率 (dBm)
+PT_DEVICE_RECEIVE = 20        # 终端设备接收功率 (dBm)
 PT_EDGE_TRANSMIT = 24         # 边缘节点传输功率 (dBm)
 PT_CLOUD_DOWN = 30            # 云到边缘下行传输功率(dBm)
 RATE_CU = 120                 # 边缘到云上行速率 (Mbps)
@@ -92,13 +94,14 @@ RATE_CD = 150                 # 边缘到云下行速率 (Mbps)
 # 计算模型参数
 # 终端设备计算资源
 F_L_MIN = 0.4e9               # 最小CPU频率 (0.4GHz)
-F_L_MAX = 2.9e9               # 最大CPU频率 (2.9GHz)
+F_L_MAX = 2.0e9               # 最大CPU频率 (2.0GHz) (原为2.9e9)
 # 边缘节点计算资源
 F_E_MIN = 2.9e9               # 最小CPU频率 (2.9GHz)
-F_E_MAX = 4.3e9               # 最大CPU频率 (4.3GHz)
+F_E_MAX = 5.0e9               # 最大CPU频率 (5.0GHz) (原为4.3e9)
 # 计算复杂度范围
 COMPUTE_COMPLEXITY_MIN = 300   # cycles/bit
 COMPUTE_COMPLEXITY_MAX = 500   # cycles/bit
+COMPUTATION_ENERGY_SCALE = 0.01 # 计算能耗缩放因子，用于平衡物理模型
 
 # 李雅普诺夫权重参数
 ALPHA = 0.5                   # 延迟权重
@@ -108,13 +111,16 @@ BETA = 0.5                    # 能耗权重
 MAX_COST_PER_ROUND = 200.0    # 预估的单轮最大成本
 MAX_Q_ENERGY_PER_ROUND = 1000.0  # 预估的单轮最大队列能量项
 
-# 奖励权重
-W_COST = 0.4                  # 成本权重
-W_Q = 0.5                     # 队列权重  
-W_LOSS = 0.1                  # 损失权重
+# 奖励权重 - 重新平衡
+W_COST = 0.6                  # 降低成本权重
+W_Q = 0.3                     # 降低队列权重
+W_LOSS = 0.1                  # 提高损失（性能）权重
+
+# ==================== 李雅普诺夫优化参数 ====================
+LYAPUNOV_V = 1.0  # 李雅普诺夫漂移+惩罚项的V值，用于权衡成本与队列稳定性 (原为0.1)
 
 # ATAFL算法相关
-ATAFL_ETA = 0.5  
+ATAFL_ETA = 0.5
 
 # ==============================================================================
 # 4. 客户端配置 (clients.py)
@@ -144,15 +150,18 @@ DRL_TRAIN = True              # 是否训练DRL模型
 DRL_ALGO = 'pdqn'             # 默认DRL算法
 
 # DRL超参数
-DRL_LR = 0.0003               # DRL学习率
-DRL_BATCH_SIZE = 512          # DRL批次大小
+DRL_LR = 0.0003               # DRL学习率 (原为0.0001, 调高以增强学习信号)
+DRL_BATCH_SIZE = 256          # DRL批次大小 (原为512)
 DRL_GAMMA = 0.99              # DRL折扣因子
-DRL_MEMORY_SIZE = 20000       # DRL回放缓存区大小
+DRL_MEMORY_SIZE = 100000      # DRL回放缓存区大小 (原为20000)
+EPSILON_INITIAL = 0.6         # 初始探索率 (原为0.9)
+EPSILON_FINAL = 0.05          # 最终探索率
+EPSILON_DECAY_STEPS = 100     # ε衰减的Episode步数 (原为150)
 
 # DRL网络参数
 RESNET_HIDDEN_SIZE = 256       # ResNet隐藏层大小
 RESNET_NUM_BLOCKS = 2          # ResNet残差块数量
-TAU = 0.005                   # 目标网络软更新参数
+TAU = 0.001                   # 目标网络软更新参数 (降低以增加稳定性)
 ACTOR_LR = 3e-4               # Actor学习率
 CRITIC_LR = 3e-4              # Critic学习率
 UPDATE_GLOBAL_ITER = 5        # 更新全局网络的频率

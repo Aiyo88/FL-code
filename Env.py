@@ -6,6 +6,8 @@ import gym
 from gym import spaces
 from utils.data_utils import get_dataset
 import os
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader as GraphDataLoader
 
 # 导入配置参数
 from config import *
@@ -20,11 +22,15 @@ from models.cost_calculator import CostCalculator
 
 class Env:
     """环境类 - 提供状态、动作、奖励计算"""
-    def __init__(self, num_devices=DEFAULT_NUM_DEVICES, num_edges=DEFAULT_NUM_EDGES, energy_threshold=ENERGY_THRESHOLD):
+    def __init__(self, num_devices=DEFAULT_NUM_DEVICES, num_edges=DEFAULT_NUM_EDGES, 
+                 energy_threshold=ENERGY_THRESHOLD, clients_manager=None):
         # 系统参数
         self.N = num_devices        # 终端设备数量
         self.M = num_edges         # 边缘服务器数量
         self.K = NUM_CLOUD_SERVERS         # 云服务器数量
+        
+        self.clients_manager = clients_manager
+        self.connectivity_matrix = self._get_connectivity()
         
         # 记录历史数据
         self.T = NUM_ROUNDS       # 最大时隙数量
@@ -133,15 +139,14 @@ class Env:
         self.max_cost_per_round = MAX_COST_PER_ROUND  # 预估的单轮最大成本
         self.max_q_energy_per_round = MAX_Q_ENERGY_PER_ROUND # 预估的单轮最大队列能量项
         
-        # 为PDQN算法添加标准gym空间格式
-        # 观察空间 - 连续状态空间
-        self.observation_space = spaces.Box(
-            low=np.float32(-np.inf), 
-            high=np.float32(np.inf),
-            shape=(self.state_dim,),
-            dtype=np.float32
-        )
-        print(f"设置observation_space.shape = {self.observation_space.shape}")
+        # 为GNN定义 observation_space
+        # 节点特征维度，需要根据 _get_state 填充后的长度确定
+        node_feature_dim = 5  # 假设最大特征维度为5 (需要与_get_state同步)
+        self.observation_space = spaces.Dict({
+            'x': spaces.Box(low=-np.inf, high=np.inf, shape=(self.N + self.M, node_feature_dim), dtype=np.float32),
+            'edge_index': spaces.Box(low=0, high=self.N + self.M - 1, shape=(2, self.N * self.M * 2), dtype=np.int64),
+        })
+        print(f"设置GNN observation_space")
         
         # 定义max_episodes属性供DRL算法使用
         self.max_episodes = 0
@@ -163,7 +168,28 @@ class Env:
         # 显式声明env属性，避免类型检查器报错
         self.env = None
 
+        # GNN相关的节点类型定义
+        self.NODE_TYPE_DEVICE = 0
+        self.NODE_TYPE_EDGE = 1
+        self.NODE_TYPE_CLOUD = 2
 
+    def _get_connectivity(self):
+        """
+        计算并返回客户端到边缘节点的连接矩阵。
+        """
+        if self.clients_manager is None:
+            # 如果没有管理器信息，则退回全连接假设
+            return np.ones((self.N, self.M), dtype=bool)
+            
+        matrix = np.zeros((self.N, self.M), dtype=bool)
+        for i in range(self.N):
+            client_id = f"client{i}"
+            connected_edges = self.clients_manager.get_edge_for_client(client_id)
+            for edge_id in connected_edges:
+                edge_idx = int(edge_id.split('_')[1])
+                if edge_idx < self.M:
+                    matrix[i, edge_idx] = True
+        return matrix
 
     def reset(self):
         """重置环境时初始化所有队列"""
@@ -214,52 +240,58 @@ class Env:
         return initial_state
         
     def _get_state(self):
-        """构建符合MEC联邦学习需求的状态空间 - 基于李雅普诺夫队列理论"""
-        global_state = []
-            
-        # 李雅普诺夫队列状态 - 这是论文中的核心状态变量
-        queue_states = self.queue_manager.get_queue_states()
-        lyapunov_queues = queue_states / self.energy_max  # 归一化处理
-        
-        # 更新通信速率
-        self.comm_model.update_transmission_rates()
+        """构建图数据作为状态表示"""
+        # 1. 定义节点特征
+        node_features = []
+        node_types = []
 
+        # 设备节点 (N个)
+        queue_states = self.queue_manager.get_queue_states() / self.energy_max
         for i in range(self.N):
-            # 基于李雅普诺夫队列的状态 - 每个设备5个元素，总共5*N个元素
-            device_state = [
-                float(self.data_sizes[i]) / (100.0 * 1024 * 1024),  # 数据大小(归一化)
-                float(self.model_sizes[i]) / (10.0 * 1024 * 1024),  # 模型大小(归一化)
-                float(lyapunov_queues[i]) if i < len(lyapunov_queues) else 0.0,  # 李雅普诺夫队列状态 Q_i(t) - 论文中的核心状态
-                float(self.comp_model.f_l[i]) / 3e9 if isinstance(self.comp_model.f_l, np.ndarray) and i < len(self.comp_model.f_l) else 0.0,  # 设备CPU频率(归一化)
-                float(lyapunov_queues[i]) if i < len(lyapunov_queues) else 0.0   # 李雅普诺夫队列状态的二次项 (用于李雅普诺夫函数计算)
+            features = [
+                self.NODE_TYPE_DEVICE,
+                self.data_sizes[i] / (100.0 * 1024 * 1024),
+                self.model_sizes[i] / (10.0 * 1024 * 1024),
+                queue_states[i],
+                self.comp_model.f_l[i] / F_L_MAX,
             ]
-            
-            global_state.extend(device_state)
-        
-        # 添加通信状态向量
-        comm_state = self.comm_model.get_communication_state_vector()
-        global_state.extend(comm_state)
-        
-        # 添加计算状态向量
-        comp_state = self.comp_model.get_computation_state_vector()
-        global_state.extend(comp_state[self.N:])  # 只添加边缘节点的计算状态，设备状态已添加
-        
-        # ★★★ 新增：添加模型性能到状态向量 ★★★
-        if hasattr(self, 'server') and self.server is not None:
-            global_state.append(self.server.last_valid_test_loss)
-            global_state.append(self.server.last_valid_accuracy)
-            # 添加模型参数变化量 (归一化)
-            global_state.append(min(self.server.best_delta / 10.0, 1.0)) # 用10.0作为归一化因子
-        else:
-            # 初始状态下，性能指标为默认值
-            global_state.append(1.0) # 初始损失
-            global_state.append(0.1) # 初始准确率
-            global_state.append(1.0) # 初始模型变化量
+            node_features.append(features)
+            node_types.append(self.NODE_TYPE_DEVICE)
 
-        state = np.array(global_state, dtype=np.float32)
-        print(f"状态向量长度: {len(state)}")
+        # 边缘节点 (M个)
+        for j in range(self.M):
+            features = [
+                self.NODE_TYPE_EDGE,
+                self.comp_model.F_e[j] / F_E_MAX, # 最大能力
+                self.comp_model.f_e[j] / F_E_MAX, # 当前负载
+                self.comm_model.rate_CU / 200.0,
+                self.comm_model.rate_CD / 200.0,
+            ]
+            node_features.append(features)
+            node_types.append(self.NODE_TYPE_EDGE)
+
+        # 找到所有特征向量的最大长度，并进行填充
+        max_len = max(len(f) for f in node_features)
+        for f in node_features:
+            f.extend([0] * (max_len - len(f)))
+
+        x = torch.tensor(node_features, dtype=torch.float32)
+
+        # 2. 定义边
+        edge_list = []
+        # 设备到边缘的连接 (基于物理覆盖范围)
+        for i in range(self.N):
+            for j in range(self.M):
+                if self.connectivity_matrix[i, j]:
+                    edge_list.append([i, self.N + j])
+                    edge_list.append([self.N + j, i])
         
-        return state
+        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+
+        # 3. 创建图数据对象
+        graph_data = Data(x=x, edge_index=edge_index)
+        
+        return graph_data
 
     def step(self, action, raw_decisions, global_round_idx, episode_idx, fl_loss=None):
         """
