@@ -20,16 +20,13 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import *
 
-def set_seed(seed=SEED):
-    """设置随机种子，确保结果可复现
-    
-    Args:
-        seed: 随机种子值
-    """
+def set_seed(seed):
+    """设置随机种子"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
