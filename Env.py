@@ -107,22 +107,25 @@ class Env:
         self.state_dim = get_state_dim(self.N, self.M)
         print(f"计算的状态维度: {self.state_dim} (N={self.N}, M={self.M})")
 
-        # === 单一整数编码的离散动作空间 ===
-        # 聚合决策的可能性
-        self.aggregation_choices = self.M + 1
-        # 每个客户端的训练决策的可能性
-        self.training_choices_per_client = self.M + 1
+        # === 新动作空间设计 V2：分离聚合决策 ===
+        # 离散动作: 聚合位置 (M个边缘 + 1个云)
+        self.discrete_action_space = spaces.Discrete((self.M + 1)**(self.N + 1))
         
-        # 总的动作空间大小 = agg_choices * (train_choices_per_client ^ num_clients)
-        total_action_space_size = self.aggregation_choices * (self.training_choices_per_client ** self.N)
+        # 连续动作: 训练决策 + 资源分配
+        # N x (M+1) 矩阵:
+        # - 第0列: 本地训练决策 (倾向性)
+        # - 第1至M列: 卸载到边缘 j-1 的决策 + 资源分配比例
+        self.continuous_action_space = spaces.Box(
+            low=0, high=1, shape=(self.N, self.M + 1), dtype=np.float32
+        )
+
+        # 组合成PDQN兼容的动作空间
+        self.action_space = spaces.Tuple((
+            self.discrete_action_space,
+            self.continuous_action_space
+        ))
         
-        self.action_space = spaces.Discrete(total_action_space_size)
-        
-        print(f"单一整数编码的离散动作空间已创建:")
-        print(f"  - 聚合决策数: {self.aggregation_choices}")
-        print(f"  - 每个客户端的训练决策数: {self.training_choices_per_client}")
-        print(f"  - 客户端数量: {self.N}")
-        print(f"  - 总动作空间大小: {self.action_space.n}")
+        print(f"新动作空间 V2: 离散部分(聚合决策) {self.M+1}维, 连续部分(训练+资源分配) ({self.N}x{self.M+1})")
         
         # Lyapunov参数
         self.energy_max = energy_threshold  # 使用可配置的阈值
@@ -343,9 +346,6 @@ class Env:
             train_local_decisions, edge_train_matrix, edge_agg_decisions, cloud_agg_decision, res_alloc_matrix
         )
         
-        # 计算有效动作比例
-        valid_ratio = np.mean(valid_flags) if valid_flags else 1.0
-        
         # 记录历史数据
         for i in range(self.N):
             if i < len(delays):
@@ -362,10 +362,6 @@ class Env:
         total_reward = self.cost_calculator.calculate_lyapunov_reward(
             costs, device_energies_for_queue, self.queue_manager, fl_loss
         )
-        
-        # 对无效动作施加额外惩罚
-        if valid_ratio < 1.0:
-            total_reward -= 100.0 * (1.0 - valid_ratio) # 惩罚力度与无效比例相关
         
         # 更新队列
         self.queue_manager.update_all_queues(device_energies_for_queue)
@@ -405,7 +401,7 @@ class Env:
             "total_delay": total_delay,
             "total_energy": total_energy, 
             "total_cost": total_cost,
-            "valid_ratio": valid_ratio
+            "valid_ratio": np.mean(valid_flags) if valid_flags else 0.0
         }
         
         # 将信息保存到self.info中，确保其他方法可以访问
