@@ -14,7 +14,7 @@ from models.models import create_model
 from Env import Env
 from clients import ClientsGroup
 from server import FederatedServer
-from drl_adapters import create_drl_agent
+from drl_adapters import create_drl_agent, add_drl_args
 from plot.plot_award import log_training_result, plot_training_results, plot_all_logs, log_episode_result
 from models.action_parser import ActionParser
 # 导入配置参数
@@ -45,18 +45,14 @@ def parse_args():
     parser.add_argument('--num_episodes', type=int, default=NUM_EPISODES, help='DRL训练的Episode总数上限')
     
     parser.add_argument('--drl_train', type=int, default=int(DRL_TRAIN), help='是否训练DRL智能体 (0/1)')
-    parser.add_argument('--drl_algo', type=str, default=DRL_ALGO, help='DRL算法 (a3c/pdqn/ddpg/ppo/sac/td3)')
+    parser.add_argument('--drl_algo', type=str, default=DRL_ALGO, help='DRL算法 (pdqn)')
     parser.add_argument('--drl_load', type=str, default=None, help='加载DRL模型路径')
     
-    # DRL 智能体超参数
-    parser.add_argument('--drl_lr', type=float, default=DRL_LR, help='DRL Actor网络学习率 (LR)')
-    parser.add_argument('--drl_batch_size', type=int, default=DRL_BATCH_SIZE, help='DRL 批次大小 (BATCH_SIZE)')
-    parser.add_argument('--drl_gamma', type=float, default=DRL_GAMMA, help='DRL 折扣因子 (GAMMA)')
-    parser.add_argument('--drl_memory_size', type=int, default=DRL_MEMORY_SIZE, help='DRL 回放缓存区大小 (MEMORY)')
-
+    # --- DRL 参数 ---
+    parser = add_drl_args(parser)
+    
     # DRL 网络架构参数
-    parser.add_argument('--resnet_hidden_size', type=int, default=RESNET_HIDDEN_SIZE, help='ResNet隐藏层大小')
-    parser.add_argument('--resnet_num_blocks', type=int, default=RESNET_NUM_BLOCKS, help='ResNet残差块数量')
+    parser.add_argument('--resnet_hidden_size', type=int, default=RESNET_HIDDEN_SIZE, help='GNN隐藏层大小')
 
     # 李雅普诺夫参数
     parser.add_argument('--energy_threshold', type=float, default=ENERGY_THRESHOLD, help='李雅普诺夫队列能量阈值')
@@ -331,8 +327,8 @@ def main():
     env, global_model, test_loader, clients_manager, server, drl_agent, action_parser = init_system(args)
     
     # 根据DRL超参数为本次运行创建唯一的日志文件名
-    log_filename = (f"log_Lr_{args.drl_lr}_batch_{args.drl_batch_size}_"
-                    f"gamma_{args.drl_gamma}_memory_{args.drl_memory_size}.txt")
+    log_filename = (f"log_algo_{args.drl_algo}_actorlr_{args.actor_lr}_criticlr_{args.critic_lr}_"
+                    f"batch_{args.drl_batch_size}.txt")
     print(f"本次运行将记录到日志文件: {log_filename}")
     
     # 为每个FL轮次创建并打开详细日志文件
@@ -411,6 +407,7 @@ def main():
                 
                 # e. DRL 智能体仅存储经验
                 if args.drl_train:
+                    # 在每一步，我们仅将经验暂存到适配器的缓冲区中
                     drl_agent.learn(state, action, reward, next_state, episode_done)
 
                 # f. 更新状态
@@ -455,7 +452,7 @@ def main():
                     break
 
             # 3. Episode结束后: 执行回合制学习
-            if args.drl_train and hasattr(drl_agent, 'learn_from_episode'):
+            if args.drl_train:
                 drl_agent.learn_from_episode()
 
             # Episode结束后的处理

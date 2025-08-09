@@ -154,7 +154,7 @@ DRL_LR = 0.0003               # DRL学习率 (原为0.0001, 调高以增强学�
 DRL_BATCH_SIZE = 256          # DRL批次大小 (原为512)
 DRL_GAMMA = 0.99              # DRL折扣因子
 DRL_MEMORY_SIZE = 100000      # DRL回放缓存区大小 (原为20000)
-EPSILON_INITIAL = 0.6         # 初始探索率 (原为0.9)
+EPSILON_INITIAL = 0.3         # 初始探索率 (原为0.9)
 EPSILON_FINAL = 0.05          # 最终探索率
 EPSILON_DECAY_STEPS = 100     # ε衰减的Episode步数 (原为150)
 
