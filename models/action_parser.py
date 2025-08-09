@@ -34,48 +34,56 @@ class ActionParser:
         log_dir = os.path.dirname(log_file)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir)
+            
+        # 从环境中获取决策维度信息
+        self.aggregation_choices = self.N + 1
+        self.training_choices_per_client = self.M + 1
 
-    def parse_action_for_training(self, action, clients_manager, server):
+    def parse_action_for_training(self, action_integer, clients_manager, server):
         """
-        解析来自DRL智能体的新动作格式 (V2)
+        [整数解码] 解析来自DQN智能体的单一整数动作。
         
         Args:
-            action: (aggregation_choice, training_matrix)
-                - aggregation_choice: int, 聚合位置 (0..M-1 for edge, M for cloud)
-                - training_matrix: np.array of shape (N, M+1), 训练和资源分配矩阵
-            clients_manager: 客户端管理器
-            server: 服务器实例
+            action_integer: int, 代表所有决策的编码整数。
             
         Returns:
             一个包含解析后决策的字典
         """
-        aggregation_choice, training_matrix = action
+        temp_action = action_integer
+        
+        # 1. 解码聚合决策
+        agg_choice = temp_action % self.aggregation_choices
+        agg_location = "cloud" if agg_choice >= self.M else f"edge_{agg_choice}"
+        temp_action //= self.aggregation_choices
 
-        # 1. 解析聚合决策
-        agg_location = "cloud" if aggregation_choice >= self.M else f"edge_{aggregation_choice}"
-
-        # 2. 解析训练决策和资源分配
+        # 2. 解码N个客户端的训练决策
         local_train_decisions = np.zeros(self.N, dtype=int)
         edge_train_decisions = np.zeros((self.N, self.M), dtype=int)
-        resource_alloc_matrix = np.zeros((self.N, self.M))
-        
         client_edge_mapping = {}
+        edge_load_counter = {f"edge_{j}": 0 for j in range(self.M)}
 
         for i in range(self.N):
-            # 找到倾向性最高的一列作为决策
-            decision_idx = np.argmax(training_matrix[i, :])
+            decision = temp_action % self.training_choices_per_client
+            temp_action //= self.training_choices_per_client
             
-            if decision_idx == 0:
-                # 本地训练
+            if decision == 0:
                 local_train_decisions[i] = 1
             else:
-                # 卸载到边缘节点 (decision_idx - 1)
-                edge_idx = decision_idx - 1
-                edge_train_decisions[i, edge_idx] = 1
-                resource_alloc_matrix[i, edge_idx] = training_matrix[i, decision_idx] # 使用倾向性值作为资源分配比例
-                client_id = f"client{i}"
+                edge_idx = decision - 1
                 edge_id = f"edge_{edge_idx}"
+                edge_train_decisions[i, edge_idx] = 1
+                client_id = f"client{i}"
                 client_edge_mapping[client_id] = edge_id
+                edge_load_counter[edge_id] += 1
+
+        # 3. 生成资源分配矩阵 (均分策略)
+        resource_alloc_matrix = np.zeros((self.N, self.M))
+        for client_id, edge_id in client_edge_mapping.items():
+            client_idx = int(client_id.replace("client", ""))
+            edge_idx = int(edge_id.replace("edge_", ""))
+            
+            if edge_load_counter[edge_id] > 0:
+                resource_alloc_matrix[client_idx, edge_idx] = 1.0 / edge_load_counter[edge_id]
 
         return {
             "aggregation_location": agg_location,
