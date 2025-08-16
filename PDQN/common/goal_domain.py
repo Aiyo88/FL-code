@@ -2,7 +2,8 @@ import numpy as np
 import sys
 import os
 import gym
-from config import GOAL_WIDTH, PITCH_LENGTH, PITCH_WIDTH
+import gym_goal
+from gym_goal.envs.config import GOAL_WIDTH, PITCH_LENGTH, PITCH_WIDTH
 
 sys.path.append(os.path.abspath(os.path.pardir))
 from agents.basis import ScaledBasis  # TODO: fix relative import
