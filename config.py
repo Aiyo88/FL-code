@@ -7,7 +7,7 @@ import torch
 
 # ===== 系统配置 =====
 # 基础配置
-SEED = 42                      # 随机种子，确保结果可复现
+SEED = 42                      # 随机种子
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # 计算设备
 DISABLE_PROGRESS_BAR = False   # 是否禁用进度条显示
 
@@ -24,18 +24,18 @@ for path in [DATA_PATH, MODEL_SAVE_PATH, LOG_SAVE_PATH, CHECKPOINT_PATH]:
 # ==============================================================================
 # 1. 联邦学习超参数
 # ==============================================================================
-NUM_CLIENTS = 5               # 客户端数量
+NUM_CLIENTS = 3               # 客户端数量
 NUM_EDGES = 2                 # 边缘节点数量
 IID = True                    # 数据是否独立同分布
 NON_IID_LEVEL = 1             # 非IID程度 (1/2/3)
 
 # 训练配置
-NUM_ROUNDS = 100               # 联邦学习轮数
+NUM_ROUNDS = 150               # 联邦学习轮数
 NUM_EPISODES = 200             # DRL训练的Episode总数上限
 FL_ROUNDS_PER_EPISODE = 100    # 每个DRL Episode包含的FL轮次数量
-LOCAL_EPOCHS = 1               # 本地训练轮数 (原为5)
-BATCH_SIZE = 512               # 批次大小 (原为2048)
-LEARNING_RATE = 0.001          # 联邦学习学习率
+LOCAL_EPOCHS = 3               # 本地训练轮数 (优化：1→3，提高训练充分性)
+BATCH_SIZE = 1024              # 批次大小 (平衡：2048→1024，兼顾速度和准确率)
+LEARNING_RATE = 0.002          # 联邦学习学习率 (调整：0.003→0.002，配合1024批次)
 MOMENTUM = 0.9                 # 动量
 WEIGHT_DECAY = 1e-5            # 权重衰减
 CLIENT_FRACTION = 0.2          # 每轮参与训练的客户端比例
@@ -63,22 +63,20 @@ SAVE_FREQ = 5                  # 模型保存频率
 # 3. 环境配置 (Env.py)
 # ==============================================================================
 # 系统架构参数
-DEFAULT_NUM_DEVICES = 5        # 默认终端设备数量
+DEFAULT_NUM_DEVICES = 3        # 默认终端设备数量
 DEFAULT_NUM_EDGES = 2          # 默认边缘服务器数量
 NUM_CLOUD_SERVERS = 1          # 云服务器数量
 
 # 李雅普诺夫队列参数
-ENERGY_THRESHOLD = 500         # 李雅普诺夫队列能量阈值
-ENERGY_MAX = 500              # 最大能量
-ENERGY_REPLENISH_RATE = 5.0   # 设备每轮补充的能量 (J) (原为20.0)
+ENERGY_THRESHOLD = 10      # 李雅普诺夫队列能量阈值
 CONVERGENCE_EPSILON_ENV = 1e-3 # 环境收敛阈值
 
 # 数据和模型大小
-DEFAULT_DATA_SIZE = 10 * 1024 * 1024   # 10MB 默认数据大小
-DEFAULT_MODEL_SIZE = 2 * 1024 * 1024   # 2MB 默认模型大小
+DEFAULT_DATA_SIZE = 5 * 1024 * 1024   # 10MB 默认数据大小
+DEFAULT_MODEL_SIZE = 1 * 1024 * 1024   # 2MB 默认模型大小
 
 # 时间模型
-TIME_SLOT = 100.0                # 时隙长度 (原为0.1)
+TIME_SLOT = 10.0                # 时隙长度 (秒) - 修正为合理值
 
 # 通信模型参数
 BANDWIDTH = 6                  # 信道带宽 (MHz)
@@ -117,7 +115,7 @@ W_Q = 0.3                     # 降低队列权重
 W_LOSS = 0.1                  # 提高损失（性能）权重
 
 # ==================== 李雅普诺夫优化参数 ====================
-LYAPUNOV_V = 1.0  # 李雅普诺夫漂移+惩罚项的V值，用于权衡成本与队列稳定性 (原为0.1)
+LYAPUNOV_V = 5.0  # 李雅普诺夫漂移+惩罚项的V值，用于权衡成本与队列稳定性
 
 # ATAFL算法相关
 ATAFL_ETA = 0.5
@@ -147,14 +145,14 @@ TEST_RATIO = 0.1              # 测试集比例
 # DRL基础配置
 USE_DRL = True                # 是否使用DRL决策
 DRL_TRAIN = True              # 是否训练DRL模型
-DRL_ALGO = 'pdqn'             # 默认DRL算法
+# DRL算法固定为PDQN
 
 # DRL超参数
 DRL_LR = 0.0003               # DRL学习率 (原为0.0001, 调高以增强学习信号)
 DRL_BATCH_SIZE = 256          # DRL批次大小 (原为512)
 DRL_GAMMA = 0.99              # DRL折扣因子
 DRL_MEMORY_SIZE = 100000      # DRL回放缓存区大小 (原为20000)
-EPSILON_INITIAL = 0.3         # 初始探索率 (原为0.9)
+EPSILON_INITIAL = 0.6         # 初始探索率 (原为0.9)
 EPSILON_FINAL = 0.05          # 最终探索率
 EPSILON_DECAY_STEPS = 100     # ε衰减的Episode步数 (原为150)
 
@@ -172,8 +170,18 @@ ENTROPY_BETA = 0.01           # 熵正则化系数
 # ==============================================================================
 # 状态空间维度计算
 def get_state_dim(num_devices=DEFAULT_NUM_DEVICES, num_edges=DEFAULT_NUM_EDGES):
-    """计算状态空间维度"""
-    return 5 * num_devices + 2 * num_devices * num_edges + 3 * num_edges + 3
+    """计算状态空间维度
+    """
+    device_basic_features = 4       # [数据大小, 模型大小, 队列状态, 本地计算能力]
+    device_comm_features = 4        # 每个边缘的 [上行增益, 下行增益, 上行速率, 下行速率]
+    edge_features = 4               # [最大计算能力, 资源利用率, 云上行速率, 云下行速率]
+    
+    total_dim = (
+        num_devices * (device_basic_features + num_edges * device_comm_features) +  # 设备特征
+        num_edges * edge_features                                                   # 边缘节点特征
+    )
+    
+    return total_dim
 
 # 动作空间维度
 def get_action_dims(num_devices=DEFAULT_NUM_DEVICES, num_edges=DEFAULT_NUM_EDGES):
@@ -243,7 +251,7 @@ DEFAULT_ARGS = {
     'num_rounds': NUM_ROUNDS,
     'num_episodes': NUM_EPISODES,
     'drl_train': 1,
-    'drl_algo': DRL_ALGO,
+    # 'drl_algo': 'pdqn',  # 算法固定为PDQN
     'drl_load': None,
     'drl_lr': DRL_LR,
     'drl_batch_size': DRL_BATCH_SIZE,

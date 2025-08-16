@@ -41,14 +41,13 @@ def train_node(node, model, global_parameters, lr, local_epochs, edge_to_clients
                 )
                 results.append((client_id, params, gradients, loss, train_time, data_size))
     else:
-        # 本地训练，资源分配比例为1.0
-        alloc_ratio = resource_allocation.get((node_id, node_id), 1.0)
+        # 本地训练，资源分配比例固定为1.0（终端资源固定，不从resource_allocation读取）
         params, gradients, loss, train_time, data_size = node.train(
             model=copy.deepcopy(model),
             global_parameters=global_parameters,
             lr=lr,
             local_epochs=local_epochs,
-            allocation_ratio=alloc_ratio
+            allocation_ratio=1.0
         )
         results.append((node_id, params, gradients, loss, train_time, data_size))
     
@@ -227,7 +226,7 @@ class FederatedServer:
         
         self.convergence_deltas.append(param_delta)
 
-        # 检查收敛耐心
+        # 检查收敛
         if param_delta < CONVERGENCE_EPSILON:
             self.patience_counter += 1
         else:
@@ -270,7 +269,7 @@ class FederatedServer:
         根据聚合节点计算的聚合参数更新全局模型
         公式(5): ω^t = ∑_{i=1}^{I(t)} |D_i|/|D_{I(t)}| · ω_i^t
         """
-        # ★★★ 新增：在更新前计算模型参数变化量 ★★★
+       
         if self.last_model_params is not None:
             param_delta = 0.0
             for name in aggregated_parameters:
@@ -367,22 +366,12 @@ class FederatedServer:
         total_samples = 0
         total_loss = 0.0
         
-        # 调试信息
-        print("\n======== 训练调试信息 ========")
-        print(f"实际执行训练的节点数: {len(selected_nodes)}")
-        print(f"客户端到边缘节点映射: {client_edge_mapping}")
-        
         # 统计信息
         local_train_count = len([n for n in selected_nodes if n.startswith('client')])
         edge_train_count = len([n for n in selected_nodes if n.startswith('edge')])
         total_clients = local_train_count
         if client_edge_mapping:
             total_clients += len(client_edge_mapping)
-        
-        print(f"参与训练的客户端总数: {total_clients}")
-        print(f"  - 本地训练的客户端: {local_train_count}")
-        print(f"  - 边缘训练的客户端: {len(client_edge_mapping) if client_edge_mapping else 0}")
-        print(f"  - 执行训练的边缘节点: {edge_train_count}")
 
         # 使用ThreadPoolExecutor实现并行训练
         with ThreadPoolExecutor() as executor:
@@ -431,16 +420,9 @@ class FederatedServer:
 
         if total_samples > 0:
             avg_loss = total_loss / total_samples
-            print(f"计算平均损失: 总损失 {total_loss:.6f} / 总样本数 {total_samples} = {avg_loss:.6f}")
             for client_id in losses:
                 if losses[client_id] == 0 and data_sizes[client_id] > 0:
                     losses[client_id] = avg_loss
-        else:
-            print("警告: 没有有效的训练数据，无法计算平均损失")
-
-        print("数据大小统计:", data_sizes)
-        print("损失统计:", losses)
-        print("===========================\n")
                 
         return updates, grads, data_sizes, losses, train_times
 
@@ -535,7 +517,7 @@ class FederatedServer:
         self.last_valid_test_loss = global_test_loss
         self.last_valid_training_loss = global_training_loss
 
-        print(f"轮次 {current_round} 完成 => Acc: {accuracy:.4f}, Test Loss: {global_test_loss:.4f}, Train Loss: {global_training_loss:.4f}, Time: {training_time:.2f}s")
+        # 轮次完成，具体信息在main.py中统一打印
         
         # 从环境获取成本信息
         total_delay, total_energy, total_cost = 0, 0, 0

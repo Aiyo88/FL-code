@@ -46,7 +46,9 @@ def main():
     test_int = 728
     matrix = aggregation_choice_to_matrix(test_int)
     print(matrix)
-
+    flat_training_params = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+    training_matrix = flat_training_params.reshape(5, 2)
+    print(training_matrix)
 if __name__ == "__main__":
     main()
     

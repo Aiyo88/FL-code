@@ -9,7 +9,7 @@
 """
 
 import numpy as np
-from config import ENERGY_REPLENISH_RATE
+from config import ENERGY_THRESHOLD
 
 
 class LyapunovQueue:
@@ -21,9 +21,10 @@ class LyapunovQueue:
         """
         self.queue = 0.0    # 能量队列初始值 (代表能量赤字)
         
-    def update_queue(self, energy_consumed, energy_replenished=ENERGY_REPLENISH_RATE):
+        
+    def update_queue(self, energy_consumed, energy_avg=ENERGY_THRESHOLD):
         """
-        更新能量队列: Q(t+1) = max{0, Q(t) + E_consumed(t) - E_replenished(t)}
+        更新能量队列: Q(t+1) = max{0, Q(t) - E_replenished(t)}+ E_consumed(t) 
         
         Args:
             energy_consumed: 当前时隙消耗的能量
@@ -32,14 +33,14 @@ class LyapunovQueue:
         Returns:
             更新后的队列值
         """
-        self.queue = max(0, self.queue + energy_consumed - energy_replenished)
+        self.queue = max(0, self.queue-energy_avg)+ energy_consumed
         return self.queue
     
-    def q_u_compute(self, energy_consumed, energy_replenished=ENERGY_REPLENISH_RATE):
+    def q_u_compute(self, energy_consumed, energy_avg=ENERGY_THRESHOLD):
         """
         计算队列更新后的值，但不实际更新队列
         """
-        return max(0, self.queue + energy_consumed - energy_replenished)
+        return max(0, self.queue-energy_avg)+ energy_consumed
     
     def lyapunov_function(self):
         """

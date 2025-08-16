@@ -82,12 +82,17 @@ class ClientBase:
         for epoch in range(local_epochs):
             batch_losses = []
             for _, (images, labels) in enumerate(loader):
-                images, labels = images.to(self.device), labels.to(self.device)
+                # 优化GPU数据传输
+                images = images.to(self.device, non_blocking=NON_BLOCKING)
+                labels = labels.to(self.device, non_blocking=NON_BLOCKING)
+                
                 optimizer.zero_grad()
                 outputs = model(images)
                 loss = loss_fn(outputs, labels)
                 loss.backward()
                 optimizer.step()
+                
+                # 减少CPU-GPU同步开销
                 batch_losses.append(loss.item())
             
             epoch_loss = sum(batch_losses) / len(batch_losses) if batch_losses else 0
@@ -116,11 +121,34 @@ class Client(ClientBase):
         idxs_train = idxs[:int(TRAIN_RATIO*len(idxs))]
         idxs_val = idxs[int(TRAIN_RATIO*len(idxs)):int((TRAIN_RATIO+VAL_RATIO)*len(idxs))]
         idxs_test = idxs[int((TRAIN_RATIO+VAL_RATIO)*len(idxs)):]
-        trainloader = DataLoader(DatasetSplit(dataset, idxs_train), batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+        # 优化DataLoader配置以提高训练速度
+        trainloader = DataLoader(
+            DatasetSplit(dataset, idxs_train), 
+            batch_size=BATCH_SIZE, 
+            shuffle=True, 
+            num_workers=NUM_WORKERS,      # 多线程数据加载
+            pin_memory=PIN_MEMORY,        # GPU内存固定
+            persistent_workers=True,      # 持久化工作进程
+            prefetch_factor=2             # 预取因子
+        )
         val_bs = max(1, int(len(idxs_val)/10)) if len(idxs_val) > 0 else 1
-        validloader = DataLoader(DatasetSplit(dataset, idxs_val), batch_size=val_bs, shuffle=False, num_workers=0)
+        validloader = DataLoader(
+            DatasetSplit(dataset, idxs_val), 
+            batch_size=val_bs, 
+            shuffle=False, 
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY,
+            persistent_workers=True
+        )
         test_bs = max(1, int(len(idxs_test)/10)) if len(idxs_test) > 0 else 1
-        testloader = DataLoader(DatasetSplit(dataset, idxs_test), batch_size=test_bs, shuffle=False, num_workers=0)
+        testloader = DataLoader(
+            DatasetSplit(dataset, idxs_test), 
+            batch_size=test_bs, 
+            shuffle=False, 
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY,
+            persistent_workers=True
+        )
         return trainloader, validloader, testloader
 
     def train(self, model, global_parameters, lr, local_epochs=3, **kwargs):

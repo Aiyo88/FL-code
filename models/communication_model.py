@@ -146,32 +146,24 @@ class WirelessCommunicationModel:
             is_uplink: 是否为上行传输
             
         Returns:
-            (延迟, 发送能耗, 接收能耗): 传输延迟和两端的能耗
+            (延迟, 发送能耗): 传输延迟和发送端能耗
         """
         if is_uplink:
             rate = self.get_uplink_rate(device_idx, edge_idx)
             transmit_power_dbm = self.Pt_UP
-            # 假设边缘节点的接收功率等于其发送功率
-            receive_power_dbm = self.Pt_edge_transmit 
         else:
             rate = self.get_downlink_rate(device_idx, edge_idx)
             transmit_power_dbm = self.Pt_down
-            # 设备接收功率
-            receive_power_dbm = PT_DEVICE_RECEIVE
         
         if rate > 0:
-            delay = data_size / rate
-            
+            # 修正单位: data_size (bytes) × 8 (bits/byte) / rate (bits/sec) = seconds
+            delay = (data_size * 8) / rate
             # 将dBm转换为线性功率 (W)
             transmit_power_watt = 10**(transmit_power_dbm / 10) * 1e-3
-            receive_power_watt = 10**(receive_power_dbm / 10) * 1e-3
-
             transmit_energy = transmit_power_watt * delay
-            receive_energy = receive_power_watt * delay
-            
-            return delay, transmit_energy, receive_energy
+            return delay, transmit_energy
         else:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0
     
     def calculate_edge_to_cloud_delay_energy(self, data_size, is_uplink=True):
         """
@@ -191,8 +183,11 @@ class WirelessCommunicationModel:
             rate = self.rate_CD * 1e6  # 转换为bps
             power = self.Pt_cloud_down
         
-        delay = data_size / rate
-        energy = power * delay
+        # 修正单位: data_size (bytes) × 8 (bits/byte) / rate (bits/sec) = seconds
+        delay = (data_size * 8) / rate
+        # power 在这里应该是瓦特，需要从dBm转换
+        power_watt = 10**(power / 10) * 1e-3
+        energy = power_watt * delay
         return delay, energy
     
     def calculate_edge_to_edge_delay_energy(self, data_size, edge_rate=EDGE_TO_EDGE_RATE):

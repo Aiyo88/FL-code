@@ -51,7 +51,7 @@ class ComputationModel:
         Args:
             device_idx: 设备索引
             data_size: 数据大小 (bytes)
-            freq: 指定的计算频率 (Hz)，如果为None则使用当前分配的频率
+            freq: 保留参数，不再使用。终端设备本地计算频率固定为初始化的 self.f_l[device_idx]
             
         Returns:
             (延迟, 能耗): 计算延迟和能耗
@@ -62,54 +62,47 @@ class ComputationModel:
         # 获取计算复杂度
         cycles_per_bit = float(self.c[device_idx]) if isinstance(self.c, np.ndarray) else 0.0
         
-        # 确定计算频率
-        if freq is not None:
-            compute_freq = float(freq)
-        elif isinstance(self.f_l, np.ndarray) and device_idx < len(self.f_l):
+        # 固定使用设备的本地计算频率（初始化时随机分配）
+        if isinstance(self.f_l, np.ndarray) and device_idx < len(self.f_l):
             compute_freq = float(self.f_l[device_idx])
         else:
             compute_freq = self.f_l_min
-            
+        
         # 确保频率在有效范围内
         compute_freq = max(self.f_l_min, min(self.f_l_max, compute_freq))
         
-        # 计算延迟和能耗
-        delay = data_size * cycles_per_bit / compute_freq
+        # 计算延迟和能耗 - 修正单位
+        # data_size (bytes) × 8 (bits/byte) × cycles_per_bit (cycles/bit) / compute_freq (cycles/sec) = seconds
+        delay = (data_size * 8 * cycles_per_bit) / compute_freq
         energy = 1e-27 * (compute_freq)**3 * delay * COMPUTATION_ENERGY_SCALE
         
         return delay, energy
         
-    def calculate_edge_computation(self, edge_idx, data_size, freq=None):
+    def calculate_edge_computation(self, device_idx, edge_idx, data_size, freq):
         """
-        计算边缘计算的延迟和能耗
+        计算边缘计算的延迟和能耗 (已简化)
         
         Args:
+            device_idx: 任务所属设备索引（用于采用该设备的计算复杂度）
             edge_idx: 边缘节点索引
             data_size: 数据大小 (bytes)
-            freq: 指定的计算频率 (Hz)，如果为None则使用当前分配的频率
+            freq: 为该任务分配的特定计算频率 (Hz)
             
         Returns:
             (延迟, 能耗): 计算延迟和能耗
         """
-        if edge_idx >= self.M:
+        if edge_idx >= self.M or freq <= 0:
             return 0.0, 0.0
             
-        # 使用平均计算复杂度（可以根据任务类型调整）
-        cycles_per_bit = np.mean(self.c)
+        # 使用该任务所属设备的计算复杂度
+        cycles_per_bit = float(self.c[device_idx])
         
-        # 确定计算频率
-        if freq is not None:
-            compute_freq = float(freq)
-        elif isinstance(self.f_e, np.ndarray) and edge_idx < len(self.f_e):
-            compute_freq = float(self.f_e[edge_idx])
-        else:
-            compute_freq = self.f_e_min
-            
-        # 确保频率在有效范围内
-        compute_freq = max(self.f_e_min, min(self.f_e_max, compute_freq))
+        # 使用明确传入的、已为该任务分配好的频率
+        compute_freq = float(freq)
         
-        # 计算延迟和能耗
-        delay = data_size * cycles_per_bit / compute_freq
+        # 计算延迟和能耗 - 修正单位  
+        # data_size (bytes) × 8 (bits/byte) × cycles_per_bit (cycles/bit) / compute_freq (cycles/sec) = seconds
+        delay = (data_size * 8 * cycles_per_bit) / compute_freq
         energy = 1e-27 * (compute_freq)**3 * delay * COMPUTATION_ENERGY_SCALE
         
         return delay, energy
@@ -134,87 +127,10 @@ class ComputationModel:
         else:
             # 计算分配给该任务的CPU频率
             allocated_freq = allocation_ratio * self.F_e[edge_idx]
-            return self.calculate_edge_computation(edge_idx, data_size, freq=allocated_freq)
-            
-    def update_edge_resource_allocation(self, edge_train_matrix, res_alloc_matrix):
-        """
-        更新边缘节点的资源分配状态
-        
-        Args:
-            edge_train_matrix: 边缘训练决策矩阵 (N×M)
-            res_alloc_matrix: 资源分配矩阵 (N×M)
-        """
-        # 重置边缘节点资源分配
-        self.f_e = np.full(self.M, 0.0)
-        
-        # 根据决策矩阵更新边缘节点资源分配
-        for j in range(self.M):
-            total_alloc_freq = 0.0  # 累加分配的绝对频率
-            for i in range(self.N):
-                if (i < edge_train_matrix.shape[0] and j < edge_train_matrix.shape[1] and 
-                    edge_train_matrix[i, j] == 1):
-                    # 该设备的任务被分配到此边缘节点
-                    if (i < res_alloc_matrix.shape[0] and j < res_alloc_matrix.shape[1]):
-                        alloc_ratio = min(max(res_alloc_matrix[i, j], 0), 1)
-                        # 计算分配的绝对频率并累加
-                        total_alloc_freq += alloc_ratio * self.F_e[j]
-            
-            # 确保不超过最大值
-            self.f_e[j] = min(total_alloc_freq, self.F_e[j])
+            return self.calculate_edge_computation(device_idx, edge_idx, data_size, freq=allocated_freq)
             
     def get_computation_state_vector(self):
-        """
-        获取计算状态向量（归一化后）
-        
-        Returns:
-            计算状态向量
-        """
-        state_vector = []
-        
-        # 添加终端设备状态
-        for i in range(self.N):
-            # 设备CPU频率(归一化)
-            if isinstance(self.f_l, np.ndarray) and i < len(self.f_l):
-                normalized_freq = float(self.f_l[i]) / 3e9
-            else:
-                normalized_freq = 0.0
-            state_vector.append(normalized_freq)
-            
-        # 添加边缘节点CPU频率
-        for j in range(self.M):
-            # 当前分配的计算资源(归一化)
-            state_vector.append(self.f_e[j] / 4.5e9)
-            
-        return state_vector
-        
-    def validate_resource_constraints(self, edge_train_matrix, res_alloc_matrix):
-        """
-        验证资源约束是否满足
-        
-        Args:
-            edge_train_matrix: 边缘训练决策矩阵 (N×M)
-            res_alloc_matrix: 资源分配矩阵 (N×M)
-            
-        Returns:
-            (is_valid, violations): 是否满足约束和违反详情
-        """
-        violations = []
-        
-        # 检查边缘节点资源约束
-        for j in range(self.M):
-            total_ratio = 0.0
-            for i in range(self.N):
-                if (i < edge_train_matrix.shape[0] and j < edge_train_matrix.shape[1] and
-                    edge_train_matrix[i, j] == 1):
-                    # 累加分配给边缘节点j的资源比例
-                    if (i < res_alloc_matrix.shape[0] and j < res_alloc_matrix.shape[1]):
-                        total_ratio += min(max(res_alloc_matrix[i, j], 0), 1)
-            
-            if total_ratio > 1.0 + 1e-6:  # 添加浮点数容差
-                overuse_amount = total_ratio - 1.0
-                violations.append(f"边缘节点{j}资源分配超限: 分配比例总和 {total_ratio:.6f} > 1.0")
-        
-        return len(violations) == 0, violations
+        pass
         
     def reset_resources(self):
         """重置所有计算资源"""

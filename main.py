@@ -14,7 +14,8 @@ from models.models import create_model
 from Env import Env
 from clients import ClientsGroup
 from server import FederatedServer
-from drl_adapters import create_drl_agent
+# 直接导入PDQN实现
+from PDQN.agents.pdqn import PDQNAgent, QActor, ParamActor
 from plot.plot_award import log_training_result, plot_training_results, plot_all_logs, log_episode_result
 from models.action_parser import ActionParser
 # 导入配置参数
@@ -33,7 +34,6 @@ def parse_args():
     
     # 联邦学习参数
     parser.add_argument('--dataset', type=str, default=DEFAULT_DATASET, help='数据集 (mnist/cifar10)')
-    parser.add_argument('--model', type=str, default=DEFAULT_MODEL, help='模型类型 (cnn)')
     parser.add_argument('--num_clients', type=int, default=NUM_CLIENTS, help='客户端数量')
     parser.add_argument('--num_edges', type=int, default=NUM_EDGES, help='边缘节点数量')
     parser.add_argument('--iid', type=int, default=int(IID), help='是否为IID数据分布 (0/1)')
@@ -44,8 +44,6 @@ def parse_args():
     parser.add_argument('--num_rounds', type=int, default=NUM_ROUNDS, help='每个DRL Episode内联邦学习轮次的总数上限')
     parser.add_argument('--num_episodes', type=int, default=NUM_EPISODES, help='DRL训练的Episode总数上限')
     
-    parser.add_argument('--drl_train', type=int, default=int(DRL_TRAIN), help='是否训练DRL智能体 (0/1)')
-    parser.add_argument('--drl_algo', type=str, default=DRL_ALGO, help='DRL算法 (a3c/pdqn/ddpg/ppo/sac/td3)')
     parser.add_argument('--drl_load', type=str, default=None, help='加载DRL模型路径')
     
     # DRL 智能体超参数
@@ -54,19 +52,10 @@ def parse_args():
     parser.add_argument('--drl_gamma', type=float, default=DRL_GAMMA, help='DRL 折扣因子 (GAMMA)')
     parser.add_argument('--drl_memory_size', type=int, default=DRL_MEMORY_SIZE, help='DRL 回放缓存区大小 (MEMORY)')
 
-    # DRL 网络架构参数
-    parser.add_argument('--resnet_hidden_size', type=int, default=RESNET_HIDDEN_SIZE, help='ResNet隐藏层大小')
-    parser.add_argument('--resnet_num_blocks', type=int, default=RESNET_NUM_BLOCKS, help='ResNet残差块数量')
-
     # 李雅普诺夫参数
     parser.add_argument('--energy_threshold', type=float, default=ENERGY_THRESHOLD, help='李雅普诺夫队列能量阈值')
 
-    # GPU优化参数
-    parser.add_argument('--num_workers', type=int, default=NUM_WORKERS, help='数据加载器工作进程数')
-    parser.add_argument('--pin_memory', type=bool, default=PIN_MEMORY, help='是否将数据固定在内存中以加速GPU传输')
-    parser.add_argument('--non_blocking', type=bool, default=NON_BLOCKING, help='异步GPU数据传输')
-
-    # 只保留是否需要绘图的开关
+    # 绘图开关
     parser.add_argument('--plot', type=int, default=int(PLOT_RESULTS), help='是否生成参数比较图 (0/1)')
     
     args = parser.parse_args()
@@ -80,8 +69,8 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-def _log_round_stats(round_idx, episode_idx, args, training_args, info, reward, accuracy, loss, server):
-    """记录并打印一轮的统计信息"""
+def _log_round_stats(round_idx, episode_idx, args, training_args, info, reward, accuracy, loss, server, action_info=None):
+    """记录并打印一轮的统计信息（精简版）"""
     
     selected_nodes = training_args.get('selected_nodes', [])
     aggregation_location = training_args.get('aggregation_location', 'N/A')
@@ -89,7 +78,6 @@ def _log_round_stats(round_idx, episode_idx, args, training_args, info, reward, 
     
     client_edge_mapping = getattr(server, 'client_edge_mapping', {})
     
-    terminal_devices = [node for node in selected_nodes if node.startswith('client')]
     local_train_count = sum(drl_train_decisions)
     edge_train_count = len(drl_train_decisions) - local_train_count
 
@@ -98,24 +86,38 @@ def _log_round_stats(round_idx, episode_idx, args, training_args, info, reward, 
     total_cost = info.get("total_cost", 0.0)
     
     print(f"\n===== DRL Episode {episode_idx}, FL轮次 {round_idx} 结果 =====")
-    print(f"参与训练的客户端总数: {len(drl_train_decisions)}")
-    print(f"  - 本地训练数量: {local_train_count}")
-    print(f"  - 边缘训练数量: {edge_train_count}")
-    print(f"实际执行训练的节点数: {len(selected_nodes)}")
     
-    # 统计各边缘节点的负载
-    if client_edge_mapping:
-        edge_train_counts = {}
-        for _, edge_id in client_edge_mapping.items():
-            edge_train_counts[edge_id] = edge_train_counts.get(edge_id, 0) + 1
-        print("边缘节点训练负载:")
-        for edge_id, count in edge_train_counts.items():
-            print(f"  - {edge_id}: 为{count}个客户端训练")
+    # 1. 训练决策
+    if action_info:
+        local_train = action_info['local_train_decisions']
+        edge_train = action_info['edge_train_matrix']
+        print(f"本地训练决策: {local_train}")
+        print(f"边缘训练决策: {edge_train.tolist()}")
     
+    # 2. 客户端映射和聚合位置  
+    print(f"客户端到边缘节点映射: {client_edge_mapping}")
     print(f"聚合位置: {aggregation_location}")
+    
+    # 3. 资源分配动作
+    if action_info:
+        res_alloc = action_info['resource_alloc_matrix']
+        print(f"资源分配动作: {res_alloc.tolist()}")
+        
+        # 检查资源冲突
+        edge_train = action_info['edge_train_matrix']
+        has_conflict = False
+        for j in range(res_alloc.shape[1]):
+            total_alloc = sum(res_alloc[i, j] * edge_train[i, j] for i in range(res_alloc.shape[0]))
+            if total_alloc > 1.0:
+                has_conflict = True
+                break
+        if has_conflict:
+            print("⚠️  资源分配超限")
+    
+    # 4. 性能指标
     print(f"奖励: {reward:.4f}")
     print(f"总延迟={total_delay:.4f}s, 总能耗={total_energy:.4f}J, 总成本={total_cost:.4f}")
-    print(f"模型性能: 准确率={accuracy:.4f}, 损失={loss:.4f}")
+    print(f"准确率={accuracy:.4f}, 损失={loss:.4f}")
 
 def finalize_training(server, global_model, test_loader, args, training_stats, drl_agent):
     """完成训练并进行最终评估
@@ -140,9 +142,8 @@ def finalize_training(server, global_model, test_loader, args, training_stats, d
     
     # 保存最终模型
     server.save_model(add_round=False)
-    if args.drl_train and drl_agent is not None and hasattr(drl_agent, 'save_model'):
-        model_path = os.path.join(args.save_path, f"drl_{args.drl_algo}_final")
-        drl_agent.save_model(model_path)
+    model_path = os.path.join(args.save_path, "drl_pdqn_final")
+    drl_agent.save_models(model_path)
     
     # 打印最终统计
     print("\n训练统计:")
@@ -171,7 +172,7 @@ def finalize_training(server, global_model, test_loader, args, training_stats, d
     
     # 如果使用了DRL，记录最终的DRL算法结果
     log_training_result(
-        "FINAL_DRL", args.drl_algo,
+                    "FINAL_DRL", "pdqn",
         final_round,
         final_reward,
         final_loss,
@@ -237,7 +238,7 @@ def init_system(args):
         clients_manager=clients_manager  # <--- 传入管理器
     )
     print(f"创建环境: 终端设备={env.N}, 边缘节点={env.M}")
-    
+
     # 在加载数据集部分之前添加：
     args.dataset = args.dataset.lower()
     supported_datasets = ['mnist', 'cifar10']
@@ -248,25 +249,16 @@ def init_system(args):
         os.makedirs(args.data_path)
         print(f"Created data directory: {args.data_path}")
         
-    # 4. 环境初始化数据集 (不再需要，因为数据已在客户端管理器中处理)
-    # print("环境初始化数据集...")
-    # env_datasets, test_loader = env.initialize_dataset(
-    #     args.dataset,
-    #     bool(args.iid),
-    #     args.non_iid_level,
-    #     args.data_path
-    # )
-    # print(f"数据集初始化完成: '{args.dataset}', {'IID' if args.iid else f'非IID-L{args.non_iid_level}'}")
-    
-    # 5. 初始化模型
+    # 4. 初始化模型
     print("初始化模型...")
-    # 修正：根据数据集类型强制选择正确的模型，避免命令行参数混淆
+
     if args.dataset == 'mnist':
-        model_name = 'mnist'  # 强制为MNIST数据集使用CNNMnist模型
+        model_name = 'mnist'  
     elif args.dataset == 'cifar10':
-        model_name = 'cifar'  # 强制为CIFAR-10数据集使用CNNCifar模型
+        model_name = 'cifar' 
     else:
-        model_name = args.model # 其他情况使用指定的模型
+        # 默认使用CNN模型
+        model_name = 'cnn'
 
     global_model = create_model(model_name)
     global_model = global_model.to(device)
@@ -288,15 +280,47 @@ def init_system(args):
     
     # 7. 为环境设置客户端和服务器
     env.set_clients_and_server(clients_manager, server)
-    
-    # server.env 已在 FederatedServer.__init__ 中声明，无需额外赋值
 
-    # 8. 创建DRL智能体
-    drl_agent = create_drl_agent(args, env)
+    # 8. 直接创建PDQN智能体
+    # PDQN参数配置
+    pdqn_params = {
+        'batch_size': min(args.drl_batch_size, 256),
+        'gamma': args.drl_gamma,
+        'replay_memory_size': args.drl_memory_size,
+        'learning_rate_actor': args.drl_lr * 0.1,
+        'learning_rate_actor_param': args.drl_lr * 0.1,
+        'inverting_gradients': True,
+        'initial_memory_threshold': 32,
+        # 关闭 OU 噪声，启用 ε-分支下的区间均匀采样，便于覆盖[0,1]
+        'use_ornstein_noise': False,
+        'epsilon_steps': 30,
+        'epsilon_final': 0.02,
+        'tau_actor': 0.01,
+        'tau_actor_param': 0.005,
+        'clip_grad': 1.0,
+        'zero_index_gradients': False,
+    }
+    
+    # 网络结构参数
+    actor_kwargs = {'hidden_layers': (256, 128, 64)}
+    actor_param_kwargs = {'hidden_layers': (256, 128, 64)}
+    
+    # 创建PDQN智能体
+    print(f"PDQN智能体使用复合动作空间: {env.action_space}")
+    drl_agent = PDQNAgent(
+        env.observation_space, 
+        env.action_space,
+        actor_class=QActor,
+        actor_kwargs=actor_kwargs,
+        actor_param_class=ParamActor,
+        actor_param_kwargs=actor_param_kwargs,
+        **pdqn_params
+    )
+    
     if args.drl_load:
-        drl_agent.load_model(args.drl_load)
+        drl_agent.load_models(args.drl_load)
         print(f"加载DRL模型: {args.drl_load}")
-    print(f"创建DRL智能体: {args.drl_algo.upper()}")
+    print(f"创建DRL智能体: PDQN")
 
     # 9. 创建动作解析器
     action_parser = ActionParser(num_devices=args.num_clients, num_edges=args.num_edges)
@@ -357,6 +381,10 @@ def main():
     training_stats = {'accuracy': [], 'rewards': [], 'times': [], 'loss': [], 'training_loss': [], 'costs': [],
                       'episode_avg_rewards': [], 'episode_avg_loss': [], 'episode_avg_costs': []}
     global_round_idx = 0
+    
+    # 添加returns数组跟踪Episode表现 - 参考runliang.py
+    returns = []              # Episode累积奖励历史
+    returns_costs = []        # Episode累积成本历史
 
     # 使用tqdm创建Episode的进度条
     with tqdm_cls(total=args.num_episodes, desc="DRL Episodes", unit="episode", disable=disable_progress_bar) as episode_pbar:
@@ -374,23 +402,44 @@ def main():
             # 重置环境状态
             state = env.reset()
             episode_done = False
+            
+            # DRL智能体Episode开始
+            drl_agent.start_episode()
 
-            # 为当前episode初始化累加器
-            episode_rewards = []
-            episode_losses = []
-            episode_costs = []
+            # Episode级别统计初始化 
+            episode_rewards = []      # Episode奖励累积列表
+            episode_losses = []       # Episode损失累积列表  
+            episode_costs = []        # Episode成本累积列表
+            
+            # Episode累积变量 - 参考DRL训练流程
+            episode_reward = 0.0      # Episode总奖励
+            episode_cost = 0.0        # Episode总成本
 
             # 2. 内层循环：在当前Episode内执行FL轮次
+            
+            # 格式化初始状态
+            state = np.array(state, dtype=np.float32, copy=False)
+            
             for episode_round in range(args.num_rounds):
                 round_start_time = time.time()
                 global_round_idx += 1 # 统一在循环开始时递增，使其从1开始
                 
-                # a. DRL 决策 - 始终使用DRL智能体
-                action = drl_agent.get_action(state)
+                # a. DRL 智能体选择动作 - 每个step都重新选择
+                act, act_param = drl_agent.act(state)
+                action = (act, act_param)
                 
                 # b. 解析动作为联邦学习训练参数
                 parsed_action = action_parser.parse_action_for_training(action, clients_manager, server)
                 training_args, raw_decisions = action_parser.convert_to_fl_training_params(parsed_action)
+                
+                # 保存动作信息供后续打印使用（不在此处打印）
+                action_info = {
+                    'local_train_decisions': parsed_action['local_train_decisions'],
+                    'edge_train_matrix': parsed_action['edge_train_matrix'],
+                    'resource_alloc_matrix': parsed_action['resource_alloc_matrix'],
+                    'client_edge_mapping': parsed_action['client_edge_mapping'],
+                    'aggregation_location': parsed_action['aggregation_location']
+                }
                 
                 # 将客户端到边缘节点的映射信息保存到服务器中
                 if hasattr(server, 'client_edge_mapping'):
@@ -409,17 +458,25 @@ def main():
                 # d. 环境步进，传入已经解析好的决策和原始动作
                 next_state, reward, episode_done, info = env.step(action, raw_decisions, global_round_idx, episode_idx, global_training_loss)
                 
-                # e. DRL 智能体仅存储经验
-                if args.drl_train:
-                    drl_agent.learn(state, action, reward, next_state, episode_done)
+                # e. 格式化next_state
+                next_state = np.array(next_state, dtype=np.float32, copy=False)
+                
+                # f. DRL 智能体经验存储和学习 - 参考流程模式
+                # PDQN使用 (state, action, reward, next_state, terminal) 五元组
+                # next_action设为None，让PDQN在需要时重新计算
+                drl_agent.step(state, action, reward, next_state, None, episode_done)
 
-                # f. 更新状态
+                # g. 状态更新
                 state = next_state
                 
-                # g. 记录和打印统计信息 - 直接传递从1开始的全局轮次
-                _log_round_stats(global_round_idx, episode_idx, args, training_args, info, reward, accuracy, global_test_loss, server)
+                # h. Episode奖励和成本累积 - 参考DRL训练流程
+                episode_reward += reward
+                episode_cost += info.get('total_cost', 0.0)
+                
+                # i. 记录和打印统计信息 - 直接传递从1开始的全局轮次
+                _log_round_stats(global_round_idx, episode_idx, args, training_args, info, reward, accuracy, global_test_loss, server, action_info)
 
-                # h. 更新统计数据
+                # j. 更新统计数据
                 training_stats['accuracy'].append(accuracy)
                 training_stats['loss'].append(global_test_loss)
                 training_stats['training_loss'].append(global_training_loss)
@@ -427,21 +484,21 @@ def main():
                 training_stats['times'].append(time.time() - round_start_time)
                 training_stats['costs'].append(info.get('total_cost', 0.0))
                 
-                # 累积当前Episode的指标
+                # 累积当前Episode的指标列表
                 episode_rewards.append(reward)
                 episode_losses.append(global_test_loss)
                 episode_costs.append(info.get('total_cost', 0.0))
 
-                # i. 记录每个FL轮次的详细数据到文件 - 直接使用从1开始的全局轮次
+                # k. 记录每个FL轮次的详细数据到文件 - 直接使用从1开始的全局轮次
                 log_line = f"{global_round_idx},{reward:.4f},{info.get('total_cost', 0.0):.4f},{global_test_loss:.4f},{accuracy:.4f}\n"
                 with open(round_log_path, "a") as f:
                     f.write(log_line)
 
-                # j. 更新Episode进度条的后缀信息
+                # l. 更新Episode进度条的后缀信息
                 episode_pbar.set_postfix({
                     'FL Round': f"{episode_round+1}/{args.num_rounds}",
                     'Test Loss': f"{global_test_loss:.4f}", 'Acc': f"{accuracy:.4f}", 
-                    'Reward': f"{reward:.4f}", 'Done': episode_done
+                    'Reward': f"{reward:.4f}", 'Total': f"{episode_reward:.2f}", 'Done': episode_done
                 })
                 
                 # 如果FL模型收敛，则提前结束当前Episode
@@ -454,11 +511,11 @@ def main():
                     print(f"===== DRL Episode {episode_idx} 因环境信号而提前结束 (在FL轮次 {episode_round+1}) =====")
                     break
 
-            # 3. Episode结束后: 执行回合制学习
-            if args.drl_train and hasattr(drl_agent, 'learn_from_episode'):
-                drl_agent.learn_from_episode()
+            # 3. Episode结束后：DRL智能体的Episode级处理
+            # PDQN在Episode结束时更新epsilon等超参数
+            drl_agent.end_episode()
 
-            # Episode结束后的处理
+            # 4. Episode结束后的统计和日志处理
             if episode_rewards:
                 avg_reward = np.mean(episode_rewards)
                 avg_loss = np.mean(episode_losses)
@@ -493,9 +550,9 @@ if __name__ == "__main__":
         plot_all_logs(save_dir="./plot", show=True)
         
         # 如果使用了DRL，特别绘制DRL算法的结果
-        log_name = f"DRL_ALGO_{args.drl_algo}"
+        log_name = "DRL_ALGO_pdqn"
         if os.path.exists(os.path.join("./logs", f"{log_name}.txt")):
             plot_training_results(log_name, save_dir="./plot", show=True)
-            print(f"已生成DRL算法 {args.drl_algo} 的训练结果图表")
+            print(f"已生成DRL算法 PDQN 的训练结果图表")
         
         print("所有图表已保存到 ./plot 目录")

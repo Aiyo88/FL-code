@@ -6,8 +6,7 @@ import gym
 from gym import spaces
 from utils.data_utils import get_dataset
 import os
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader as GraphDataLoader
+# 移除GNN相关导入
 
 # 导入配置参数
 from config import *
@@ -103,7 +102,6 @@ class Env:
         # 每个终端设备状态: 5个基本状态 + M个上行速率 + M个下行速率
         # 每个边缘节点状态: 1个计算资源 + 2个与云的传输速率
         # 修正：状态维度应为 5*N (设备) + 2*N*M (设备-边缘通信) + 3*M (边缘节点状态)
-        # ★★★ 新增：添加模型性能和参数变化量到状态空间 ★★★
         self.state_dim = get_state_dim(self.N, self.M)
         print(f"计算的状态维度: {self.state_dim} (N={self.N}, M={self.M})")
 
@@ -111,21 +109,19 @@ class Env:
         # 离散动作: 聚合位置 (M个边缘 + 1个云)
         self.discrete_action_space = spaces.Discrete((self.M + 1)**(self.N + 1))
         
-        # 连续动作: 训练决策 + 资源分配
-        # N x (M+1) 矩阵:
-        # - 第0列: 本地训练决策 (倾向性)
-        # - 第1至M列: 卸载到边缘 j-1 的决策 + 资源分配比例
+        # 连续动作: 仅用于边缘资源分配 (不为本地设备分配)
+        # 展平为一维向量，长度为 N*M，解析时再 N×M 矩阵
         self.continuous_action_space = spaces.Box(
-            low=0, high=1, shape=(self.N, self.M + 1), dtype=np.float32
+            low=0, high=1, shape=(self.N * self.M,), dtype=np.float32
         )
-
+        
         # 组合成PDQN兼容的动作空间
         self.action_space = spaces.Tuple((
             self.discrete_action_space,
             self.continuous_action_space
         ))
         
-        print(f"新动作空间 V2: 离散部分(聚合决策) {self.M+1}维, 连续部分(训练+资源分配) ({self.N}x{self.M+1})")
+        print(f"离散部分{self.M+1}维, 连续部分({self.N*self.M},)")
         
         # Lyapunov参数
         self.energy_max = energy_threshold  # 使用可配置的阈值
@@ -139,14 +135,15 @@ class Env:
         self.max_cost_per_round = MAX_COST_PER_ROUND  # 预估的单轮最大成本
         self.max_q_energy_per_round = MAX_Q_ENERGY_PER_ROUND # 预估的单轮最大队列能量项
         
-        # 为GNN定义 observation_space
-        # 节点特征维度，需要根据 _get_state 填充后的长度确定
-        node_feature_dim = 5  # 假设最大特征维度为5 (需要与_get_state同步)
-        self.observation_space = spaces.Dict({
-            'x': spaces.Box(low=-np.inf, high=np.inf, shape=(self.N + self.M, node_feature_dim), dtype=np.float32),
-            'edge_index': spaces.Box(low=0, high=self.N + self.M - 1, shape=(2, self.N * self.M * 2), dtype=np.int64),
-        })
-        print(f"设置GNN observation_space")
+        # 定义observation_space为状态向量空间
+        self.observation_space = spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=(self.state_dim,), 
+            dtype=np.float32
+        )
+        print(f"状态空间维度: {self.state_dim} = {self.N}×(4+{self.M}) + {self.M}×4")
+        print(f"设置状态空间: {self.state_dim}维向量")
         
         # 定义max_episodes属性供DRL算法使用
         self.max_episodes = 0
@@ -168,10 +165,6 @@ class Env:
         # 显式声明env属性，避免类型检查器报错
         self.env = None
 
-        # GNN相关的节点类型定义
-        self.NODE_TYPE_DEVICE = 0
-        self.NODE_TYPE_EDGE = 1
-        self.NODE_TYPE_CLOUD = 2
 
     def _get_connectivity(self):
         """
@@ -221,9 +214,9 @@ class Env:
         # 重置计算模型资源
         self.comp_model.reset_resources()
         
-        # 更新通信模型的信道增益
-        self.comm_model.update_channel_gains()
-        self.comm_model.update_transmission_rates()
+        
+        # 环境随机变化
+        self._randomize_environment()
         
         # 获取初始状态
         initial_state = self._get_state()
@@ -240,58 +233,47 @@ class Env:
         return initial_state
         
     def _get_state(self):
-        """构建图数据作为状态表示"""
-        # 1. 定义节点特征
-        node_features = []
-        node_types = []
-
-        # 设备节点 (N个)
-        queue_states = self.queue_manager.get_queue_states() / self.energy_max
+        """构建状态向量 - 使用原始物理量，不进行归一化"""
+        # 获取原始队列状态（不归一化）
+        queue_states = self.queue_manager.get_queue_states()
+        
+        # 构建状态向量
+        state = []
+        
+        # 1. 设备状态 - 使用原始物理量
         for i in range(self.N):
-            features = [
-                self.NODE_TYPE_DEVICE,
-                self.data_sizes[i] / (100.0 * 1024 * 1024),
-                self.model_sizes[i] / (10.0 * 1024 * 1024),
-                queue_states[i],
-                self.comp_model.f_l[i] / F_L_MAX,
-            ]
-            node_features.append(features)
-            node_types.append(self.NODE_TYPE_DEVICE)
-
-        # 边缘节点 (M个)
-        for j in range(self.M):
-            features = [
-                self.NODE_TYPE_EDGE,
-                self.comp_model.F_e[j] / F_E_MAX, # 最大能力
-                self.comp_model.f_e[j] / F_E_MAX, # 当前负载
-                self.comm_model.rate_CU / 200.0,
-                self.comm_model.rate_CD / 200.0,
-            ]
-            node_features.append(features)
-            node_types.append(self.NODE_TYPE_EDGE)
-
-        # 找到所有特征向量的最大长度，并进行填充
-        max_len = max(len(f) for f in node_features)
-        for f in node_features:
-            f.extend([0] * (max_len - len(f)))
-
-        x = torch.tensor(node_features, dtype=torch.float32)
-
-        # 2. 定义边
-        edge_list = []
-        # 设备到边缘的连接 (基于物理覆盖范围)
-        for i in range(self.N):
+            # 设备基本信息（保持原始物理量）
+            state.extend([
+                self.data_sizes[i],                  # 原始数据大小 (bytes)
+                self.model_sizes[i],                 # 原始模型大小 (bytes)
+                queue_states[i],                     # 原始队列状态 (energy units)
+                self.comp_model.f_l[i],             # 原始本地计算频率 (Hz)
+            ])
+            
+            # 设备与边缘的通信状态（原始值）
             for j in range(self.M):
                 if self.connectivity_matrix[i, j]:
-                    edge_list.append([i, self.N + j])
-                    edge_list.append([self.N + j, i])
+                    # 原始通信参数
+                    state.extend([
+                        self.comm_model.h_up[i, j],      # 原始上行信道增益
+                        self.comm_model.h_down[i, j],    # 原始下行信道增益
+                        self.comm_model.R_up[i, j],      # 原始上行传输速率 (bps)
+                        self.comm_model.R_down[i, j],    # 原始下行传输速率 (bps)
+                    ])
+                else:
+                    # 不连接时全为0
+                    state.extend([0.0, 0.0, 0.0, 0.0])
         
-        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-
-        # 3. 创建图数据对象
-        graph_data = Data(x=x, edge_index=edge_index)
+        # 2. 边缘节点状态 - 使用原始物理量
+        for j in range(self.M):
+            state.extend([
+                self.comp_model.F_e[j],              # 原始最大计算频率 (Hz)
+                self.comp_model.f_e[j],              # 原始当前分配频率 (Hz)
+                self.comm_model.rate_CU,             # 原始云上行速率 (bps)
+                self.comm_model.rate_CD,             # 原始云下行速率 (bps)
+            ])
         
-        return graph_data
+        return np.array(state, dtype=np.float32)
 
     def step(self, action, raw_decisions, global_round_idx, episode_idx, fl_loss=None):
         """
@@ -311,38 +293,29 @@ class Env:
             "valid_ratio": 1.0 # 假设所有动作都是有效的
         }
         
-        # 提取解析结果 - 直接从传入的raw_decisions获取
-        train_local_decisions = raw_decisions.get('local_train', np.zeros(self.N))
-        edge_train_decisions = raw_decisions.get('edge_train', np.zeros(self.N * self.M))
-        edge_agg_decisions = raw_decisions.get('edge_agg', np.zeros(self.M))
-        cloud_agg_decision = raw_decisions.get('cloud_agg', 0)
-        res_alloc_flat = raw_decisions.get('resource_alloc', np.zeros(self.N * self.M))
-        
-        # 环境随机变化
-        self._randomize_environment()
-        
-        # 将训练决策转换为矩阵形式
-        edge_train_matrix = np.zeros((self.N, self.M), dtype=int)
-        valid_indices = min(len(edge_train_decisions), self.N * self.M)
 
-        for idx in range(valid_indices):
-            i = idx // self.M  # 行索引
-            j = idx % self.M   # 列索引
-            edge_train_matrix[i, j] = int(edge_train_decisions[idx])
         
-        # 将资源分配转换为矩阵形式
-        res_alloc_matrix = np.zeros((self.N, self.M))
-        flat_idx = 0
-        for i in range(self.N):
-            for j in range(self.M):
-                if flat_idx < len(res_alloc_flat):
-                    res_alloc_matrix[i, j] = res_alloc_flat[flat_idx]
-                else:
-                    res_alloc_matrix[i, j] = 0.5  # 默认值
-                flat_idx += 1
+        # 提取解析结果 - 直接从传入的raw_decisions获取
+        train_local_decisions = raw_decisions.get('local_train', np.zeros(self.N,dtype=int))
+        edge_train_matrix = raw_decisions.get('edge_train', np.zeros((self.N, self.M),dtype=int))
+        edge_agg_decisions = raw_decisions.get('edge_agg', np.zeros(self.M,dtype=int))
+        cloud_agg_decision = raw_decisions.get('cloud_agg', 0)
+        res_alloc_matrix = raw_decisions.get('resource_alloc', np.zeros((self.N, self.M),dtype=float))
+
+        # 将连续动作从[-1,1]线性映射到[0,1]，再裁剪并按卸载选择掩码
+        try:
+            res_alloc_matrix = np.array(res_alloc_matrix, dtype=float)
+            edge_train_matrix = np.array(edge_train_matrix, dtype=int)
+            res_alloc_matrix = (res_alloc_matrix + 1.0) / 2.0
+            res_alloc_matrix = np.clip(res_alloc_matrix, 0.0, 1.0)
+            res_alloc_matrix *= edge_train_matrix
+        except Exception:
+            res_alloc_matrix = np.zeros((self.N, self.M), dtype=float)
+
+
         
         # 使用成本计算器计算延迟和能耗
-        delays, energies, costs, device_energies_for_queue, valid_flags = self.cost_calculator.calculate_system_total_cost(
+        delays, energies, costs, valid_flags, penalty_flag = self.cost_calculator.calculate_system_total_cost(
             train_local_decisions, edge_train_matrix, edge_agg_decisions, cloud_agg_decision, res_alloc_matrix
         )
         
@@ -357,18 +330,15 @@ class Env:
         total_delay = sum(delays)
         total_energy = sum(energies)
         total_cost = sum(costs)
+        # 更新队列
+        self.queue_manager.update_all_queues(energies)
         
         # 使用成本计算器计算奖励
         total_reward = self.cost_calculator.calculate_lyapunov_reward(
-            costs, device_energies_for_queue, self.queue_manager, fl_loss
+            costs, energies, self.queue_manager, penalty_flag=penalty_flag
         )
         
-        # 更新队列
-        self.queue_manager.update_all_queues(device_energies_for_queue)
         
-        # 更新计算模型的资源分配状态
-        self.comp_model.update_edge_resource_allocation(edge_train_matrix, res_alloc_matrix)
-
         # 更新状态
         next_state = self._get_state()
         self.current_fl_round += 1 # 内部的episode轮次计数器仍然需要

@@ -60,7 +60,7 @@ class ActionParser:
 
     def parse_action_for_training(self, action, clients_manager, server):
         """
-        解析来自DRL智能体的新动作格式 (V2)
+        解析来自DRL智能体的新动作格式 
         
         Args:
 
@@ -70,7 +70,10 @@ class ActionParser:
         Returns:
             一个包含解析后决策的字典
         """
-        aggregation_choice, training_matrix = action
+        aggregation_choice, flat_training_params = action
+        # 将一维连续动作重塑为 N×M 矩阵
+        training_matrix = flat_training_params.reshape(self.N, self.M)
+        
         # 将 aggregation_choice 解码为 aggregation_matrix
         aggregation_matrix = self.aggregation_choice_to_matrix(aggregation_choice)
 
@@ -94,6 +97,7 @@ class ActionParser:
             else:
                 # 卸载到边缘节点
                 edge_train_decisions[i, decision_idx] = 1
+                # 连续动作矩阵形状 (N, M)，列j对应edge_j的资源分配比例
                 resource_alloc_matrix[i, decision_idx] = training_matrix[i, decision_idx]
                 client_id = f"client{i}"
                 edge_id = f"edge_{decision_idx}"
@@ -133,8 +137,7 @@ class ActionParser:
             if local_train[i] == 1:
                 client_id = f"client{i}"
                 selected_nodes.append(client_id)
-                # 任务标识符: (执行节点, 代理客户端) -> 资源比例
-                resource_allocation[(client_id, client_id)] = 1.0 # 本地训练独占资源
+                # 本地训练不需要资源分配比例（终端资源固定），不写入resource_allocation
         
         # 卸载训练的客户端 (由边缘节点代理)
         for client_id, edge_id in client_edge_mapping.items():
@@ -145,19 +148,18 @@ class ActionParser:
             edge_idx = int(edge_id.replace("edge_", ""))
             
             # 任务标识符: (执行节点, 代理客户端) -> 资源比例
-            ratio = res_alloc[client_idx, edge_idx]
-            resource_allocation[(edge_id, client_id)] = ratio
+            resource_allocation[(edge_id, client_id)] = res_alloc[client_idx, edge_idx]
 
         # 准备 training_args
         training_args = {
             'selected_nodes': selected_nodes,
             'resource_allocation': resource_allocation,
             'aggregation_location': agg_location,
-            'drl_train_decisions': local_train.tolist(), # 保持与旧格式的兼容
+            'drl_train_decisions': local_train.tolist(), 
         }
 
         # 准备 raw_decisions (用于环境步进)
-        edge_agg = np.zeros(self.M)
+        edge_agg = np.zeros(self.M,dtype=int)
         cloud_agg = 0
         if agg_location == "cloud":
             cloud_agg = 1
@@ -171,10 +173,10 @@ class ActionParser:
 
         raw_decisions = {
             'local_train': local_train,
-            'edge_train': edge_train_matrix.flatten(),
+            'edge_train': edge_train_matrix,
             'edge_agg': edge_agg,
             'cloud_agg': np.array(cloud_agg),
-            'resource_alloc': res_alloc.flatten(),
+            'resource_alloc': res_alloc,
             'edge_client_mapping': client_edge_mapping
         }
         
@@ -184,16 +186,26 @@ class ActionParser:
         """
         在新动作空间下，大部分约束在解析时已强制满足，
         主要检查资源分配是否超限。
+        注意：只对被实际选择卸载到边缘的任务进行汇总（带掩码），
+        避免将未选择的连续参数噪声计入导致误报。
         """
         if raw_decisions is None:
             return False
             
-        res_alloc_flat = raw_decisions.get('resource_alloc', [])
-        res_alloc_matrix = np.array(res_alloc_flat).reshape((self.N, self.M))
+        # 资源分配矩阵 (N, M)
+        res_alloc = raw_decisions.get('resource_alloc', np.zeros((self.N, self.M)))
+        res_alloc_matrix = np.array(res_alloc).reshape((self.N, self.M))
+        # 卸载选择矩阵 (N, M)，用于掩码
+        edge_train_matrix = raw_decisions.get('edge_train', np.zeros((self.N, self.M), dtype=int))
+        edge_train_matrix = np.array(edge_train_matrix).reshape((self.N, self.M))
         
         violations = []
         for j in range(self.M):
-            total_ratio = np.sum(res_alloc_matrix[:, j])
+            # 只统计卸载到该边缘j的设备的资源比例之和
+            masked_col = res_alloc_matrix[:, j] * edge_train_matrix[:, j]
+            # 处理数值异常
+            masked_col = np.nan_to_num(masked_col, nan=0.0, posinf=0.0, neginf=0.0)
+            total_ratio = float(np.sum(masked_col))
             if total_ratio > 1.0 + CONSTRAINT_TOLERANCE:
                 violations.append(f"Edge {j} resource overuse: {total_ratio:.4f} > 1.0")
         
